@@ -62,7 +62,14 @@ var (
 	proxyURL       *url.URL
 	proxyActive    bool
 	proxyTransport *http.Transport
+	printMu        sync.Mutex
 )
+
+func safePrintf(format string, a ...any) {
+	printMu.Lock()
+	fmt.Printf(format, a...)
+	printMu.Unlock()
+}
 
 func initProxy(raw string) bool {
 	if raw == "" {
@@ -165,9 +172,9 @@ func generateDefaultConfig(path string) error {
 					PreferredDomains: []string{},
 				},
 				{
-					FileName: "subdomain.txt",
-					Template: domainTpl,
-					Subtype:  "domain",
+					FileName:         "subdomain.txt",
+					Template:         domainTpl,
+					Subtype:          "domain",
 					PreferredDomains: []string{"1.example.com", "2.example.com", "3.example.com"},
 				},
 			},
@@ -218,7 +225,7 @@ func applyConfig(cfg *AppConfig, visited map[string]bool) {
 	if !visited["max"] && cfg.Max > 0 {
 		*maxThreads = cfg.Max
 	}
-	if !visited["speedtest"] && cfg.SpeedTest > 0 {
+	if !visited["speedtest"] {
 		*speedTest = cfg.SpeedTest
 	}
 	if !visited["url"] && cfg.URL != "" {
@@ -227,10 +234,10 @@ func applyConfig(cfg *AppConfig, visited map[string]bool) {
 	if !visited["delay"] {
 		*delay = cfg.Delay
 	}
-	if !visited["minspeed"] && cfg.MinSpeed > 0 {
+	if !visited["minspeed"] {
 		*minSpeed = cfg.MinSpeed
 	}
-	if !visited["minspeedcount"] && cfg.MinSpeedCount > 0 {
+	if !visited["minspeedcount"] {
 		*minSpeedCount = cfg.MinSpeedCount
 	}
 	if !visited["proxy"] && cfg.Proxy != "" {
@@ -242,7 +249,7 @@ func applyConfig(cfg *AppConfig, visited map[string]bool) {
 	if !visited["history"] && cfg.History != "" {
 		*flagHistory = cfg.History
 	}
-	if !visited["historycount"] && cfg.HistoryCount > 0 {
+	if !visited["historycount"] {
 		*flagHistoryCount = cfg.HistoryCount
 	}
 	if !visited["historylimit"] {
@@ -363,7 +370,7 @@ func increaseMaxOpenFiles() {
 	cmd := exec.Command("sh", "-c", "ulimit -n 10000")
 	_, err := cmd.CombinedOutput()
 	if err != nil {
-		fmt.Printf("提升文件描述符上限时出现错误: %v\n", err)
+		safePrintf("提升文件描述符上限时出现错误: %v\n", err)
 	}
 }
 
@@ -500,12 +507,13 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 			defer func() {
 				<-thread
 				wg.Done()
+				printMu.Lock()
 				count++
 				percentage := float64(count) / float64(total) * 100
-				fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\r", count, total, percentage)
-				if count == total {
-					fmt.Printf("已完成: %d 总数: %d 已完成: %.2f%%\n", count, total, percentage)
+				if count == total || count%10 == 0 {
+					fmt.Printf("[连通性检测] 已完成: %d / %d (%.2f%%)\n", count, total, percentage)
 				}
+				printMu.Unlock()
 			}()
 
 			parts := strings.Fields(ip)
@@ -533,7 +541,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 
 			probe, perr := probeIP(ipAddr, port)
 			if perr != nil {
-				fmt.Printf("IP %s 端口 %d 真连接请求失败, 已排除\n", ipAddr, port)
+				safePrintf("IP %s 端口 %d 真连接请求失败, 已排除\n", ipAddr, port)
 				return
 			}
 
@@ -565,8 +573,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 
 	var results []speedtestresult
 	if *speedTest > 0 {
-		fmt.Printf("\n找到符合条件的IP共 %d 个\n", atomic.LoadInt32(&validCount))
-		fmt.Printf("\n开始测速...\n")
+		safePrintf("\n找到符合条件的IP共 %d 个\n\n开始测速...\n", atomic.LoadInt32(&validCount))
 
 		total := len(resultChan)
 		var wg2 sync.WaitGroup
@@ -601,16 +608,17 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 					if enableEarlyStop && downloadSpeed >= minSp {
 						if atomic.AddInt32(&qualified, 1) >= int32(minCnt) {
 							if atomic.CompareAndSwapInt32(&stop, 0, 1) {
-								fmt.Printf("\n已达到合格 IP 数量 %d (速度>=%.2f MB/s), 停止后续测速\n", minCnt, minSp)
+								safePrintf("\n已达到合格 IP 数量 %d (速度>=%.2f MB/s), 停止后续测速\n", minCnt, minSp)
 							}
 						}
 					}
 
 					c := atomic.AddInt32(&doneCount, 1)
 					percentage := float64(c) / float64(total) * 100
-					fmt.Printf("已完成: %.2f%%\r", percentage)
 					if int(c) >= total {
-						fmt.Printf("结束测速, 已完成: %.2f%%\033[0\n", percentage)
+						safePrintf("结束测速, 已完成: %.2f%%\n", percentage)
+					} else if int(c)%10 == 0 {
+						safePrintf("[测速进度] 已完成: %d / %d (%.2f%%)\n", c, total, percentage)
 					}
 				}
 			}()
@@ -621,6 +629,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 			fmt.Println()
 		}
 	} else {
+		safePrintf("\n找到符合条件的IP共 %d 个 (已禁用下载测速)\n", atomic.LoadInt32(&validCount))
 		for res := range resultChan {
 			results = append(results, speedtestresult{result: res})
 		}
@@ -732,7 +741,7 @@ func appendHistory(results []speedtestresult, cfg *AppConfig, ts time.Time) erro
 	}
 	f.Close()
 
-	fmt.Printf("\n[[history] 已归档前 %d 个结果到 %s\n", count, cfg.History)
+	fmt.Printf("\n[history] 已归档前 %d 个结果到 %s\n", count, cfg.History)
 
 	if cfg.HistoryLimit > 0 {
 		removed, err := trimHistory(cfg.History, cfg.HistoryLimit)
@@ -902,7 +911,7 @@ func getDownloadSpeed(ip string, port int) float64 {
 	written, _ := io.Copy(io.Discard, resp.Body)
 	duration := time.Since(startTime)
 	speed := float64(written) / duration.Seconds() / 1024 / 1024
-	fmt.Printf("IP %s 端口 %d 下载速度 %.2f MB/s\n", ip, port, speed)
+	safePrintf("IP %s 端口 %d 下载速度 %.2f MB/s\n", ip, port, speed)
 	return speed
 }
 
