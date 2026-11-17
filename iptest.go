@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"crypto/tls"
 	"encoding/base64"
@@ -35,23 +34,25 @@ const (
 )
 
 var (
-	File         = flag.String("file", "ip.txt", "IP地址文件名称, 支持路径, 格式为 ip port")
-	outFile      = flag.String("outfile", "ip.csv", "输出文件名称, 支持路径")
+	outFile      = flag.String("outfile", "html/result.csv", "输出结果文件, 支持路径")
 	maxThreads   = flag.Int("max", 100, "并发请求最大协程数")
 	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=20000000", "测速文件地址")
-	delay        = flag.Int("delay", 0, "延迟阈值(ms)，默认为0禁用延迟过滤")
+	delay        = flag.Int("delay", 0, "延迟阈值(ms), 默认为0禁用延迟过滤")
 
-	flagSub  = flag.Bool("sub", false, "只读取测速结果文件生成订阅")
-	flagDns  = flag.Bool("dns", false, "只读取测速结果文件推送 DNS")
-	flagUrls = flag.String("urls", "", "递归下载 URL 列表中的 IP 作为测速输入, 逗号分隔; 支持 file:// 或裸本地路径")
+	// 输入源：合并了原 file 与 urls
+	flagSources = flag.String("sources", "", "输入源列表（逗号分隔）, 本地文件路径或 URL, 自动识别；显式指定时覆盖配置文件 sources")
+	flagFile    = flag.String("file", "", "输入文件（单个, 兼容旧版；追加到 sources）")
+	flagUrls    = flag.String("urls", "", "输入源列表（逗号分隔, 兼容旧版；追加到 sources）")
 
-	proxyFlag = flag.String("proxy", "", "代理地址, 例如 socks5://127.0.0.1:10808, 为空则直连; 仅用于 urls 下载与 DNS 推送")
+	flagSub = flag.Bool("sub", false, "只读取测速结果文件生成订阅")
+	flagDns = flag.Bool("dns", false, "只读取测速结果文件推送 DNS")
+
+	proxyFlag = flag.String("proxy", "", "代理地址, 例如 socks5://127.0.0.1:10808, 为空则直连; 仅用于远程下载与 DNS 推送")
 
 	minSpeed      = flag.Float64("minspeed", 0, "下载速度合格指标(MB/s), 0为不限制, 例如2表示2MB/s, 支持小数如1.5")
 	minSpeedCount = flag.Int("minspeedcount", 0, "达到合格速度的IP数量限制, 达到后提前停止测速, 0为不限制")
 
-	// 历史最优归档
 	flagHistoryEnable = flag.Bool("historyenable", false, "启用历史最优归档")
 	flagHistory       = flag.String("history", "", "历史最优归档文件, 例如 bestip.csv")
 	flagHistoryCount  = flag.Int("historycount", 3, "每次归档的排名数量, 默认 3")
@@ -91,7 +92,7 @@ func initProxy(raw string) bool {
 		fmt.Printf("[proxy] 代理请求 probe 返回 %d, 将直连\n", statusCode)
 		return false
 	}
-	fmt.Printf("[proxy] 代理可用: %s ; 后续 urls 下载与 dns 推送走代理\n", raw)
+	fmt.Printf("[proxy] 代理可用: %s ; 后续远程下载与 DNS 推送走代理\n", raw)
 	proxyURL = u
 	proxyActive = true
 	proxyTransport = &http.Transport{Proxy: http.ProxyURL(u)}
@@ -106,9 +107,10 @@ func newOutboundHTTPClient(t time.Duration) *http.Client {
 }
 
 type AppConfig struct {
-	File          string    `json:"file"`
+	Sources       []string  `json:"sources"`
 	OutFile       string    `json:"outfile"`
-	URLs          string    `json:"urls"`
+	File          string    `json:"file,omitempty"`
+	URLs          string    `json:"urls,omitempty"`
 	Proxy         string    `json:"proxy"`
 	Max           int       `json:"max"`
 	SpeedTest     int       `json:"speedtest"`
@@ -133,13 +135,12 @@ func defaultConfigPath() string {
 }
 
 func generateDefaultConfig(path string) error {
-	ipTpl := "vless://AreYouOK@{ip}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=%2FAreYouOK&mode=auto#{node_name_tpl}"
-	domainTpl := "vless://AreYouOK@{domain}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=%2FAreYouOK&mode=auto#{domain}"
+	ipTpl := "vless://AreYouOK@{ip}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=/AreYouOK&mode=auto#{node_name_tpl}"
+	domainTpl := "vless://AreYouOK@{domain}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=/AreYouOK&mode=auto#{domain}"
 
 	cfg := AppConfig{
-		File:          "ip.txt",
-		OutFile:       "ip.csv",
-		URLs:          "",
+		Sources:       []string{"html/bestip.csv"},
+		OutFile:       "html/result.csv",
 		Proxy:         "",
 		Max:           100,
 		SpeedTest:     5,
@@ -148,7 +149,7 @@ func generateDefaultConfig(path string) error {
 		MinSpeed:      0,
 		MinSpeedCount: 0,
 		HistoryEnable: false,
-		History:       "",
+		History:       "html/bestip.csv",
 		HistoryCount:  3,
 		HistoryLimit:  1000,
 		SubConfig: SubConfig{
@@ -168,9 +169,7 @@ func generateDefaultConfig(path string) error {
 					FileName: "subdomain.txt",
 					Template: domainTpl,
 					Subtype:  "domain",
-					PreferredDomains: []string{
-						"1.example.com", "2.example.com", "3.example.com",
-					},
+					PreferredDomains: []string{"1.example.com", "2.example.com", "3.example.com"},
 				},
 			},
 		},
@@ -214,9 +213,6 @@ func loadOrCreateConfig() (*AppConfig, error) {
 }
 
 func applyConfig(cfg *AppConfig, visited map[string]bool) {
-	if !visited["file"] && cfg.File != "" {
-		*File = cfg.File
-	}
 	if !visited["outfile"] && cfg.OutFile != "" {
 		*outFile = cfg.OutFile
 	}
@@ -372,6 +368,49 @@ func increaseMaxOpenFiles() {
 	}
 }
 
+func collectSources(cfg *AppConfig, visited map[string]bool) []string {
+	var raw []string
+
+	if visited["sources"] {
+		raw = append(raw, splitURLs(*flagSources)...)
+	} else {
+		raw = append(raw, cfg.Sources...)
+		// 兼容旧配置字段
+		if cfg.File != "" {
+			raw = append(raw, cfg.File)
+		}
+		if cfg.URLs != "" {
+			raw = append(raw, splitURLs(cfg.URLs)...)
+		}
+	}
+
+	// 命令行兼容参数
+	if visited["file"] {
+		raw = append(raw, *flagFile)
+	}
+	if visited["urls"] {
+		raw = append(raw, splitURLs(*flagUrls)...)
+	}
+
+	// 去重
+	seen := make(map[string]bool)
+	var unique []string
+	for _, s := range raw {
+		s = strings.TrimSpace(s)
+		if s == "" || seen[s] {
+			continue
+		}
+		seen[s] = true
+		unique = append(unique, s)
+	}
+
+	// 默认
+	if len(unique) == 0 {
+		unique = []string{"ip.txt"}
+	}
+	return unique
+}
+
 func main() {
 	flag.Parse()
 
@@ -405,30 +444,28 @@ func main() {
 
 	initProxy(*proxyFlag)
 
-	urlsStr := *flagUrls
-	if urlsStr == "" && cfg.URLs != "" {
-		urlsStr = cfg.URLs
-	}
-	if urlsStr != "" {
-		fmt.Printf("开始从 URL 提取 IP 源: %s\n", urlsStr)
-		urlList := splitURLs(urlsStr)
-		ips, err := fetchIPsFromURLs(urlList, 2)
-		if err != nil {
-			fmt.Printf("下载 IP 源失败: %v\n", err)
-			return
+	sources := collectSources(cfg, visited)
+	fmt.Printf("[source] 待处理输入源: %d 个\n", len(sources))
+	for i, s := range sources {
+		kind := "远程"
+		if isLocalSource(s) {
+			kind = "本地"
 		}
-		if len(ips) == 0 {
-			fmt.Println("未从 URL 中提取到有效 IP")
-			return
-		}
-		if err := writeIPs(*File, ips); err != nil {
-			fmt.Printf("写入 IP 文件失败: %v\n", err)
-			return
-		}
-		fmt.Printf("已从 URL 提取 %d 个 IP 写入 %s\n", len(ips), *File)
+		fmt.Printf("[source]   %d. [%s] %s\n", i+1, kind, s)
 	}
 
-	runSpeedtest(cfg)
+	ips, err := fetchIPsFromSources(sources, 2)
+	if err != nil {
+		fmt.Printf("加载输入源失败: %v\n", err)
+		return
+	}
+	if len(ips) == 0 {
+		fmt.Println("未从输入源中提取到有效 IP")
+		return
+	}
+	fmt.Printf("[source] 共提取 %d 个有效 IP 用于测速\n\n", len(ips))
+
+	runSpeedtest(cfg, ips)
 
 	if cfg.SubConfig.Enabled {
 		fmt.Println("[sub] 测速完成, 开始生成订阅...")
@@ -440,18 +477,17 @@ func main() {
 	}
 }
 
-func runSpeedtest(cfg *AppConfig) {
+func runSpeedtest(cfg *AppConfig, ips []string) {
+	if len(ips) == 0 {
+		fmt.Println("没有可测速的 IP")
+		return
+	}
+
 	var validCount int32
 	startTime := time.Now()
 	osType := runtime.GOOS
 	if osType == "linux" {
 		increaseMaxOpenFiles()
-	}
-
-	ips, err := readIPs(*File)
-	if err != nil {
-		fmt.Printf("无法从文件中读取 IP: %v\n", err)
-		return
 	}
 
 	var wg sync.WaitGroup
@@ -534,8 +570,8 @@ func runSpeedtest(cfg *AppConfig) {
 
 	var results []speedtestresult
 	if *speedTest > 0 {
-		fmt.Printf("找到符合条件的IP 共 %d 个\n", atomic.LoadInt32(&validCount))
-		fmt.Printf("开始测速\n")
+		fmt.Printf("\n找到符合条件的IP共 %d 个\n", atomic.LoadInt32(&validCount))
+		fmt.Printf("\n开始测速...\n")
 
 		total := len(resultChan)
 		var wg2 sync.WaitGroup
@@ -579,7 +615,7 @@ func runSpeedtest(cfg *AppConfig) {
 					percentage := float64(c) / float64(total) * 100
 					fmt.Printf("已完成: %.2f%%\r", percentage)
 					if int(c) >= total {
-						fmt.Printf("已完成: %.2f%%\033[0\n", percentage)
+						fmt.Printf("结束测速, 已完成: %.2f%%\033[0\n", percentage)
 					}
 				}
 			}()
@@ -650,7 +686,7 @@ func runSpeedtest(cfg *AppConfig) {
 		}
 	}
 
-	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n",
+	fmt.Printf("\n有效IP数量: %d | 成功将结果写入文件 %s, 耗时 %d秒\n",
 		atomic.LoadInt32(&validCount), *outFile, time.Since(startTime)/time.Second)
 }
 
@@ -701,7 +737,7 @@ func appendHistory(results []speedtestresult, cfg *AppConfig, ts time.Time) erro
 	}
 	f.Close()
 
-	fmt.Printf("[history] 已归档前 %d 个结果到 %s\n", count, cfg.History)
+	fmt.Printf("\n[[history] 已归档前 %d 个结果到 %s\n", count, cfg.History)
 
 	if cfg.HistoryLimit > 0 {
 		removed, err := trimHistory(cfg.History, cfg.HistoryLimit)
@@ -840,29 +876,6 @@ func probeIP(ipAddr string, port int) (*probeResponse, error) {
 		return nil, fmt.Errorf("真连接返回错误")
 	}
 	return &data, nil
-}
-
-func readIPs(file string) ([]string, error) {
-	f, err := os.Open(file)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	var ips []string
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := scanner.Text()
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			continue
-		}
-		port, err := strconv.Atoi(parts[1])
-		if err != nil {
-			continue
-		}
-		ips = append(ips, fmt.Sprintf("%s %d", parts[0], port))
-	}
-	return ips, scanner.Err()
 }
 
 func getDownloadSpeed(ip string, port int) float64 {
@@ -1073,46 +1086,81 @@ func extractIPsLikeAwk(content string) []string {
 	return out
 }
 
-func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
+func parseIPsFromContent(content string) []string {
+	var result []string
+	seen := make(map[string]bool)
+
+	add := func(ipPort string) {
+		if !seen[ipPort] {
+			seen[ipPort] = true
+			result = append(result, ipPort)
+		}
+	}
+
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 精确匹配 "IP 端口" 格式
+		parts := strings.Fields(line)
+		if len(parts) == 2 {
+			if ip := net.ParseIP(parts[0]); ip != nil {
+				if port, err := strconv.Atoi(parts[1]); err == nil && port > 0 && port <= 65535 {
+					add(parts[0] + " " + strconv.Itoa(port))
+					continue
+				}
+			}
+		}
+
+		// 兜底：awk 提取逻辑（只保留 443）
+		for _, ip := range extractIPsLikeAwk(line) {
+			add(ip + " 443")
+		}
+	}
+	return result
+}
+
+func fetchIPsFromSources(sources []string, maxDepth int) ([]string, error) {
 	type task struct {
-		url   string
-		depth int
+		source string
+		depth  int
 	}
 	client := newOutboundHTTPClient(20 * time.Second)
 
-	seenURL := make(map[string]bool)
+	seenSource := make(map[string]bool)
 	enqueued := make(map[string]bool)
 	seenIP := make(map[string]bool)
 	var ipOrder []string
 
 	var queue []task
-	for _, u := range urls {
-		if !enqueued[u] {
-			enqueued[u] = true
-			queue = append(queue, task{u, 0})
+	for _, s := range sources {
+		if !enqueued[s] {
+			enqueued[s] = true
+			queue = append(queue, task{s, 0})
 		}
 	}
-	fmt.Printf("[urls] 初始待处理 URL: %d 个\n", len(queue))
 
-	var downloaded int
+	var processed int
 	for len(queue) > 0 {
 		t := queue[0]
 		queue = queue[1:]
-		if seenURL[t.url] {
+		if seenSource[t.source] {
 			continue
 		}
-		seenURL[t.url] = true
-		downloaded++
+		seenSource[t.source] = true
+		processed++
 
-		kind := "请求远程"
-		if isLocalSource(t.url) {
-			kind = "读取本地"
+		kind := "远程"
+		if isLocalSource(t.source) {
+			kind = "本地"
 		}
-		fmt.Printf("[urls] (%d) %s 深度=%d: %s\n", downloaded, kind, t.depth, t.url)
+		fmt.Printf("[source] (%d) %s 深度=%d: %s\n", processed, kind, t.depth, t.source)
 
-		content, err := downloadContent(client, t.url)
+		content, err := downloadContent(client, t.source)
 		if err != nil {
-			fmt.Printf("[urls] 加载失败 [%s]: %v\n", t.url, err)
+			fmt.Printf("[source] 加载失败 [%s]: %v\n", t.source, err)
 			continue
 		}
 
@@ -1121,17 +1169,17 @@ func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
 			texts = append(texts, dec)
 		}
 
-		urlNew := 0
+		sourceNew := 0
 		for _, text := range texts {
-			for _, ip := range extractIPsLikeAwk(text) {
-				if !seenIP[ip] {
-					seenIP[ip] = true
-					ipOrder = append(ipOrder, ip)
-					urlNew++
+			for _, ipPort := range parseIPsFromContent(text) {
+				if !seenIP[ipPort] {
+					seenIP[ipPort] = true
+					ipOrder = append(ipOrder, ipPort)
+					sourceNew++
 				}
 			}
 		}
-		fmt.Printf("[urls]     └─ 新增 IP: %d, 累计唯一 IP: %d\n", urlNew, len(ipOrder))
+		fmt.Printf("[source]     └─ 新增 IP: %d, 累计唯一 IP: %d\n", sourceNew, len(ipOrder))
 
 		if t.depth < maxDepth {
 			urlFound := 0
@@ -1145,29 +1193,11 @@ func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
 				}
 			}
 			if urlFound > 0 {
-				fmt.Printf("[urls]     └─ 发现新 URL: %d, 队列剩余: %d\n", urlFound, len(queue))
+				fmt.Printf("[source]     └─ 发现新来源: %d, 队列剩余: %d\n", urlFound, len(queue))
 			}
 		}
 	}
 
-	fmt.Printf("[urls] 递归完成: 共处理 %d 个来源, 提取唯一 IP 共 %d 个\n", downloaded, len(ipOrder))
+	fmt.Printf("[source] 完成: 共处理 %d 个来源, 提取唯一 IP: %d 个\n", processed, len(ipOrder))
 	return ipOrder, nil
-}
-
-func writeIPs(fileName string, ips []string) error {
-	if dir := filepath.Dir(fileName); dir != "." && dir != "" {
-		if err := os.MkdirAll(dir, 0755); err != nil {
-			return fmt.Errorf("创建目录失败 [%s]: %v", dir, err)
-		}
-	}
-	f, err := os.Create(fileName)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	w := bufio.NewWriter(f)
-	for _, ip := range ips {
-		fmt.Fprintf(w, "%s 443\n", ip)
-	}
-	return w.Flush()
 }

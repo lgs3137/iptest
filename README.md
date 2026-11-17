@@ -1,6 +1,6 @@
 # iptest
 
-[![Release](https://github.com/lgs3137/iptest/actions/workflows/Releases.yml/badge.svg)](https://github.com/lgs3137/iptest/actions/workflows/Releases.yml)
+<p><a href="https://www.gnu.org/licenses/gpl-3.0"><img src="https://img.shields.io/badge/License-GPLv3-blue.svg" alt="License: GPL v3" /></a> <a href="https://github.com/lgs3137/iptest/actions"><img src="https://github.com/lgs3137/iptest/actions/workflows/Releases.yaml/badge.svg" alt="Github Actions Badge"></a></p>
 
 一个用于 **Cloudflare 优选 IP 测速 / 订阅生成 / Cloudflare DNS 推送 / 历史归档** 的多功能命令行工具。
 
@@ -11,6 +11,7 @@
 - [功能特性](#功能特性)
 - [项目结构](#项目结构)
 - [快速开始](#快速开始)
+- [输入源设计](#输入源设计)
 - [命令行参数](#命令行参数)
 - [配置文件详解](#配置文件详解)
 - [工作模式](#工作模式)
@@ -19,7 +20,7 @@
 - [历史最优归档](#历史最优归档)
 - [代理支持](#代理支持)
 - [速度合格提前停止](#速度合格提前停止)
-- [URL 递归下载](#url-递归下载)
+- [多源递归提取](#多源递归提取)
 - [路径支持](#路径支持)
 - [输出结果](#输出结果)
 - [构建与发布](#构建与发布)
@@ -31,13 +32,13 @@
 ## 功能特性
 
 - 🚀 **IP 延迟测速**：TCP 三次握手延迟测量，可通过 `-delay` 阈值过滤
-- 🌍 **信息探测**：候选IP真连接验证并获取 **数据中心 / 国家 / 城市 / ASN / 出口 IP**
+- 🌍 **信息探测**：候选 IP 真连接验证（TLS SNI 探测）并获取 **数据中心 / 国家 / ASN / 出口 IP**
 - 📶 **下载测速**：并发下载测速，单位 **MB/s**，可按合格速度提前停止
-- 🔗 **URL 递归下载**：支持明文订阅、base64 订阅、任意文本，可从 `http(s)://` 与 `file://` 及裸本地路径中提取 IPv4，可递归发现新来源
-- 📝 **订阅生成**：同时支持 `ip`（测速 IP）和 `domain`（优选域名）两种节点类型，可选 base64 编码
+- 🔗 **多源递归提取**：支持明文订阅、Base64 订阅、任意文本，支持 `http(s)://`、`file://` 及本地路径混合输入，并在内存中递归发现新来源
+- 📝 **订阅生成**：同时支持 `ip`（测速 IP）和 `domain`（优选域名）两种节点类型，可选 Base64 编码
 - ☁️ **Cloudflare DNS 推送**：自动判断 A / AAAA 记录，存在则更新，不存在则新建
-- 🗂 **历史最优归档**：每次测速后自动把排名前 N 的结果追加到历史文件，并可设置最大行数避免无限增长，历史文件可再次作为输入源
-- 🔌 **代理支持**：urls 下载与 DNS 推送可走 `socks5://` 或 `http://` 代理，测速仍保持直连
+- 🗂 **历史最优归档**：每次测速后自动把排名前 N 的结果追加到历史文件，并可设置最大行数避免无限增长，历史文件可直接作为输入源复用
+- 🔌 **代理支持**：远程输入源下载与 DNS 推送可走 `socks5://` 或 `http://` 代理，测速仍保持直连
 - ⚙️ **配置优先**：命令行参数 > `config.json` > 内置默认值，配置文件缺失时自动生成
 - 🖥️ **多平台**：Linux / Windows / macOS 全平台、多架构发布（含 UPX 压缩）
 
@@ -47,11 +48,10 @@
 
 ```
 .
-├── iptest.go         # 主入口、测速、URL 递归下载、代理初始化、历史归档
+├── iptest.go         # 主入口、测速、多源采集、代理初始化、历史归档
 ├── subscription.go   # 订阅文件生成
 ├── dns.go            # Cloudflare DNS 推送
 ├── config.json       # 配置文件（首次运行自动生成）
-├── ip.txt            # 输入 IP 列表（每行 "IP 端口"）
 ├── ip.csv            # 测速结果（固定 9 列）
 ├── bestip.csv        # 历史最优归档（可选，需开启 history_enable）
 └── html/             # 订阅输出目录
@@ -61,14 +61,27 @@
 
 ## 快速开始
 
-### 1. 准备 IP 列表
+### 1. 准备输入
 
-在 `ip.txt` 中每行写入 `IP 端口`：
+`config.json` 中的 `sources` 数组支持本地与远程源的任意组合：
 
+```json
+{
+  "sources": [
+    "html/bestip.csv",
+    "https://sub.example.com/list.txt",
+    "/opt/iptest/data/ips.txt",
+    "file:///opt/iptest/history/bestip.csv"
+  ]
+}
 ```
-104.16.1.1 443
-104.16.2.2 443
-```
+
+每个元素可以是：
+- **本地文件**：`ip.txt`、`/opt/x.txt`、`./data/y.txt`、`C:\z.txt`
+- **file:// URL**：`file:///opt/x.txt`
+- **远程 URL**：`https://...`、`http://...`
+
+程序自动识别每个源的类型，本地读盘、远程下载，直接在内存中统一提取并去重 IP（无需生成中间文件）。
 
 ### 2. 运行
 
@@ -76,13 +89,14 @@
 # 全流程（读取 config.json 或自动生成）
 ./iptest
 
-# 只测速
-./iptest -file ip.txt -outfile ip.csv -speedtest 5
+# 命令行显式指定输入源（覆盖配置）
+./iptest -sources "ip.txt,https://sub.example.com/list.txt"
 
-# 从 URL 提取 IP 后再测速（支持远程 / 本地）
-./iptest -urls "https://sub.example.com/list.txt"
-./iptest -urls "file:///opt/iptest/all.txt"
-./iptest -urls "/opt/iptest/all.txt"
+# 命令行单个本地文件（兼容旧版 -file，追加到 sources）
+./iptest -file ip.txt
+
+# 命令行输入源列表（兼容旧版 -urls，追加到 sources）
+./iptest -urls "https://a.com/x.txt,file:///opt/y.txt"
 
 # 只读测速结果生成订阅
 ./iptest -sub
@@ -104,21 +118,59 @@
 
 ---
 
+## 输入源设计
+
+**`sources` 数组**是输入源的核心入口。程序对每个元素执行以下流程：
+
+1. **加载内容**：本地读盘 / 远程下载（若启用代理则走代理）
+2. **尝试 Base64 解码**：如果是 Base64 编码内容，自动解码后与原文一并参与提取
+3. **提取 IP**：
+   - 行格式为 `IP 端口`（空格分隔）时：保留原端口（如 `1.1.1.1 8443`）
+   - 否则走等价 awk 逻辑：提取有效 IPv4 并默认匹配 `443` 端口（忽略非法段及非 443 端口）
+4. **递归发现新来源**：文本中出现 `http(s)://` 或 `file://` 时自动入队继续处理（最大递归深度 ≤ 2）
+
+**优先级规则**：
+
+| 命令行参数 | 行为 |
+|------------|------|
+| 未传任何源参数 | 使用配置文件 `sources`（如为空则默认 `["ip.txt"]`） |
+| 传 `-sources` | **完全覆盖**配置文件的 `sources` |
+| 传 `-file` / `-urls` | **追加**到当前 `sources` 列表（兼容旧版参数） |
+
+**去重**：所有源处理完成后，最终提取的 `IP:Port` 列表全局去重。
+
+**向后兼容**：配置文件中的 `file` 和 `urls` 字段仍可读取，会自动合并到 `sources`。建议迁移到新格式：
+
+```jsonc
+// 旧格式（仍兼容）
+{
+  "file": "ip.txt",
+  "urls": "https://x.com/a.txt"
+}
+
+// 新格式（推荐）
+{
+  "sources": ["ip.txt", "https://x.com/a.txt"]
+}
+```
+
+---
+
 ## 命令行参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `-file` | `ip.txt` | 输入 IP 文件，格式 `IP 端口`，**支持路径** |
-| `-outfile` | `ip.csv` | 测速结果输出文件，**支持路径** |
+| `-sources` | `""` | 输入源列表（逗号分隔），本地或 URL，自动识别；**覆盖**配置文件 `sources` |
+| `-file` | `""` | 输入文件（单个，兼容旧版；追加到 `sources`） |
+| `-urls` | `""` | 输入源列表（逗号分隔，兼容旧版；追加到 `sources`） |
+| `-outfile` | `ip.csv` | 测速结果输出文件，支持路径 |
 | `-max` | `100` | TCP / probe 阶段并发协程数 |
 | `-speedtest` | `5` | 下载测速并发协程数，`0` 表示禁用测速 |
-| `-url` | `speed.cloudflare.com/__down?bytes=20000000` | 测速文件地址（不带协议头） |
-| `-tls` | `true` | 是否使用 HTTPS |
+| `-url` | `speed.cloudflare.com/__down?bytes=20000000` | 测速文件地址（不带 `https://` 协议头） |
 | `-delay` | `0` | TCP 延迟阈值（ms），`0` 禁用过滤 |
 | `-sub` | `false` | **只**读取测速结果并生成订阅 |
 | `-dns` | `false` | **只**读取测速结果并推送 DNS |
-| `-urls` | `""` | 递归下载的来源列表（逗号分隔），支持 `http(s)://`、`file://`、裸本地路径 |
-| `-proxy` | `""` | 代理地址，如 `socks5://127.0.0.1:10808`，仅 urls 下载与 DNS 推送走代理 |
+| `-proxy` | `""` | 代理地址，如 `socks5://127.0.0.1:10808`，仅远程下载与 DNS 推送走代理 |
 | `-minspeed` | `0` | 下载速度合格线（**MB/s**，支持小数如 `1.5`），`0` 不限制 |
 | `-minspeedcount` | `0` | 合格 IP 数量上限，达到后提前停止测速，`0` 不限制 |
 | `-historyenable` | `false` | 是否启用历史归档 |
@@ -134,40 +186,40 @@
 
 ```jsonc
 {
-  "file": "ip.txt",
-  "outfile": "ip.csv",
-  "urls": "",                 // 非空时优先于 file：先下载提取 IP 写入 file
-  "proxy": "",                // socks5://127.0.0.1:10808 或 http://...
+  "sources": [
+    "html/bestip.csv"
+  ],
+  "outfile": "html/result.csv",
+  "proxy": "",                  // socks5://127.0.0.1:10808 或 http://...
   "max": 100,
   "speedtest": 5,
   "url": "speed.cloudflare.com/__down?bytes=20000000",
-  "tls": true,
   "delay": 0,
-  "min_speed": 0,             // 单位 MB/s
+  "min_speed": 0,               // 单位 MB/s
   "min_speed_count": 0,
 
-  "history_enable": false,    // 是否启用历史归档
-  "history": "",              // 归档文件路径，例如 "bestip.csv" 或 "/opt/iptest/history/bestip.csv"
-  "history_count": 3,         // 每次归档前 N 个，默认 3
-  "history_limit": 1000,      // 历史文件最大数据行数，0 表示不限制
+  "history_enable": false,      // 是否启用历史归档
+  "history": "html/bestip.csv", // 归档文件路径，例如 "bestip.csv" 或 "/opt/iptest/history/bestip.csv"
+  "history_count": 3,           // 每次归档前 N 个，默认 3
+  "history_limit": 1000,        // 历史文件最大数据行数，0 表示不限制
 
   "sub_config": {
-    "enabled": false,         // 测速完成后是否自动生成订阅
+    "enabled": false,           // 测速完成后是否自动生成订阅
     "output_dir": "./html",
-    "count": 15,             // ip 类型节点的数量上限
+    "count": 15,                // ip 类型节点的数量上限
     "node_name_tpl": "{index}{Country}{CountryCode}{ip}",
     "b64encode": true,
     "templates": [ /* 见下文 */ ]
   },
 
   "dns_config": {
-    "enabled": false,        // 测速完成后是否自动推送 DNS
+    "enabled": false,           // 测速完成后是否自动推送 DNS
     "token": "cfut_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
     "zone_id": "yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy",
     "domain_tpl": "{index}.example.com",
     "count": 9,
-    "ttl": 300,
-    "proxied": false
+    "ttl": 300,                 // 5分钟
+    "proxied": false            // 是否开启小黄云
   }
 }
 ```
@@ -176,7 +228,7 @@
 
 **配置文件位置**：与可执行文件同目录（`filepath.Dir(os.Executable())`）。若不存在，首次运行自动生成默认配置。
 
-**路径字段**：`file` / `outfile` / `urls`（内嵌本地路径）/ `history` 均支持相对或绝对路径；写出时父目录不存在会自动创建。
+**路径字段**：`sources`（内嵌本地路径）/ `outfile` / `history` / `sub_config.output_dir` 均支持相对或绝对路径；写出时父目录不存在会自动创建。
 
 ---
 
@@ -184,10 +236,10 @@
 
 | 命令 | 行为 |
 |------|------|
-| `./iptest` | 加载配置 → 若 `urls` 非空则先下载提取 IP → 测速 → 写 `outfile` → 若 `history_enable` 则归档 → 若 `sub_config.enabled` 则生成订阅 → 若 `dns_config.enabled` 则推送 DNS |
+| `./iptest` | 加载配置 → 采集并去重 `sources` 中的 IP → 测速 → 写 `outfile` → 若 `history_enable` 则归档 → 若 `sub_config.enabled` 则生成订阅 → 若 `dns_config.enabled` 则推送 DNS |
 | `./iptest -sub` | 加载配置 → 读 `outfile` → 生成订阅（要求 `sub_config.enabled=true`） |
-| `./iptest -dns` | 加载配置 → 读 `outfile` → 推送 DNS（要求 `dns_config.enabled=true`，可走代理） |
-| `./iptest -urls "..."` | 优先使用命令行 `urls`，下载提取 IP 写入 `file` → 进入测速主流程 |
+| `./iptest -dns` | 加载配置 → 读 `outfile` → 推送 DNS（要求 `dns_config.enabled=true`，支持走代理） |
+| `./iptest -sources "..."` | 覆盖配置中的 `sources`，提取 IP → 进入测速主流程 |
 | `./iptest -historyenable -history bestip.csv` | 主流程结束后追加历史归档 |
 
 ---
@@ -196,14 +248,14 @@
 
 ### 模板变量
 
-`template` 字段支持以下占位符：
+`template` 字段支持以下占位符（**大小写不敏感**）：
 
 | 变量 | 说明 |
 |------|------|
 | `{ip}` | 测速 IP |
 | `{domain}` | 优选域名（仅 `subtype=domain` 时有效） |
 | `{port}` | 端口 |
-| `{node_name_tpl}` | 节点名称（由 `node_name_tpl` 渲染后填入） |
+| `{node_name_tpl}` | 节点名称（由 `node_name_tpl` 渲染后填入；`domain` 类型时默认使用域名本身） |
 
 `node_name_tpl` 字段支持以下占位符（**大小写不敏感**）：
 
@@ -246,7 +298,7 @@
 ### 输出
 
 - 明文（`b64encode=false`）：每行一个节点
-- base64 编码（`b64encode=true`）：整段 base64
+- Base64 编码（`b64encode=true`）：整段 Base64 编码输出
 
 ---
 
@@ -308,7 +360,7 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 - **无表头**
 - 每组前一行 `# 时间`（注释行，再次作为输入源时会被自动忽略）
-- 数据行与 `ip.csv` 相同 9 列，但**延迟为纯整数毫秒**（不带 ` ms`）
+- 数据行与 `ip.csv` 相同 9 列（延迟为纯整数毫秒）
 
 示例：
 
@@ -373,11 +425,14 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 ### 归档文件复用为输入源
 
-把归档文件加入 `urls`，下次测速时优先复用历史最优：
+把归档文件加入 `sources`，下次测速时优先复用历史最优：
 
 ```jsonc
 {
-  "urls": "file:///opt/iptest/history/bestip.csv,https://sub.example.com/list.txt"
+  "sources": [
+    "file:///opt/iptest/history/bestip.csv",
+    "https://sub.example.com/list.txt"
+  ]
 }
 ```
 
@@ -387,7 +442,7 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 在配置中提供 `proxy`，或通过 `-proxy` 指定：
 
-非空启动时会先通过该代理请求验证：
+非空启动时会先通过该代理进行连通性验证：
 
 - 返回 **200** → 启用代理
 - 请求失败 / 非 200 → 打印告警，**自动回退直连**
@@ -396,9 +451,9 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 | 请求类型 | 是否走代理 |
 |---------|-----------|
-| urls 递归下载（远程） | ✅ |
+| `sources` 远程 URL 下载 | ✅ |
 | DNS 推送（查询 + 提交） | ✅ |
-| urls 读取本地文件 | ❌ 直接读盘 |
+| `sources` 读取本地文件 | ❌ 直接读盘 |
 | probe 探测（连接待测 IP） | ❌ 直连 |
 | 下载测速（连接待测 IP） | ❌ 直连 |
 
@@ -414,7 +469,7 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 - 每完成一次下载测速，若 `>= min_speed`，合格计数 +1
 - 合格计数达到 `min_speed_count` 时，剩余待测 IP 不再测速
-- 最终输出仍按 **下载速度降序** 排序
+- 最终输出仍按 **下载速度降序** 排序（若禁用下载测速 `-speedtest 0` 则按延迟升序排序）
 - 若全量测完仍不足 `min_speed_count`，以实际数量为准
 
 **示例**：
@@ -433,45 +488,46 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 ---
 
-## URL 递归下载
+## 多源递归提取
 
-`-urls` 或 `urls` 配置非空时，**优先于 `file`** 执行：
+程序启动时按队列顺序处理 `sources` 中的所有输入源（全内存处理，不落盘中间文件）：
 
-1. 逐个加载来源内容（明文 / base64 均可），来源可以是：
+1. 逐个加载来源内容（明文 / Base64 均可），来源可以是：
    - `http://` / `https://` 远程 URL
    - `file:///abs/path` 本地文件
    - 裸本地路径，如 `/opt/x.txt`、`./data/y.txt`、`C:\z.txt`
-2. 用等价 awk 逻辑从文本中提取 IPv4：
-   - 忽略段值 > 255 的非法 IP
-   - 忽略端口非 443 的 `IP:PORT` / `IP,PORT`
-   - 全局去重
-3. 对文本中出现的 `http(s)://` 与 `file://` 继续递归（默认深度 ≤ 3）
-4. 所有提取到的 IP 写入 `file`（默认 `ip.txt`），随后进入正常测速流程
+2. 提取有效 IP 列表：
+   - 若行格式为 `IP 端口`，保留其指定端口
+   - 否则用等价 awk 逻辑提取 IPv4（忽略段值 > 255 的非法 IP、忽略非 443 端口）并附加 `443` 端口
+3. 对文本中出现的 `http(s)://` 与 `file://` 继续入队递归（最大深度 ≤ 2）
+4. 全局去重后直接送入并发测速流程
 
 **输出示例**：
 
 ```
-[urls] 初始待处理 URL: 1 个
-[urls] (1) 读取本地 深度=0: file:///opt/iptest/history/bestip.csv
-[urls]     └─ 新增 IP: 15, 累计唯一 IP: 15
-[urls] (2) 请求远程 深度=0: https://sub.example.com/list.txt
-[urls]     └─ 新增 IP: 5, 累计唯一 IP: 20
-[urls]     └─ 发现新 URL: 1, 队列剩余: 1
-[urls] (3) 请求远程 深度=1: https://example.com/extra.txt
-[urls]     └─ 新增 IP: 3, 累计唯一 IP: 23
-[urls] 递归完成: 共处理 3 个来源, 提取唯一 IP 共 23 个
-已从 URL 提取 23 个 IP 写入 ip.txt
+[source] 待处理输入源: 2 个
+[source]   1. [本地] file:///opt/iptest/history/bestip.csv
+[source]   2. [远程] https://sub.example.com/list.txt
+[source] (1) 本地 深度=0: file:///opt/iptest/history/bestip.csv
+[source]     └─ 新增 IP: 15, 累计唯一 IP: 15
+[source] (2) 远程 深度=0: https://sub.example.com/list.txt
+[source]     └─ 新增 IP: 5, 累计唯一 IP: 20
+[source]     └─ 发现新来源: 1, 队列剩余: 1
+[source] (3) 远程 深度=1: https://example.com/extra.txt
+[source]     └─ 新增 IP: 3, 累计唯一 IP: 23
+[source] 完成: 共处理 3 个来源, 提取唯一 IP: 23 个
+[source] 共提取 23 个有效 IP 用于测速
 ```
 
 ---
 
 ## 路径支持
 
-`file`、`outfile`、`history` 三个配置字段均支持相对与绝对路径：
+`sources`（本地路径）、`outfile`、`history`、`sub_config.output_dir` 均支持相对与绝对路径：
 
 ```bash
 # 输入路径带目录
-./iptest -file ./data/ips.txt
+./iptest -sources ./data/ips.txt
 
 # 输出路径带目录（父目录不存在会自动创建）
 ./iptest -outfile /opt/iptest/out/ip.csv
@@ -484,7 +540,7 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 ```jsonc
 {
-  "file": "/opt/iptest/data/ip.txt",
+  "sources": ["/opt/iptest/data/ip.txt"],
   "outfile": "/opt/iptest/out/ip.csv",
   "history": "/opt/iptest/history/bestip.csv"
 }
@@ -494,11 +550,11 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 | 字段 | 何时自动创建父目录 |
 |------|-------------------|
-| `file` | 由 urls 下载写入时 |
 | `outfile` | 测速结果写出时 |
 | `history` | 归档追加时 |
+| `sub_config.output_dir` | 生成订阅文件时 |
 
-> 若 `file` 由 `-file` 指定但文件不存在，`readIPs` 会直接报错退出（缺少输入源）。
+> 若 `sources` 中的本地文件不存在，会打印 `[source] 加载失败` 日志并跳过该源；若所有源均未提取到有效 IP，程序将提示并退出。
 
 ---
 
@@ -506,19 +562,19 @@ Zone ID 在域名管理页的 **Overview → API** 右侧可见。
 
 ### 测速结果 `ip.csv`
 
-固定 9 列，与是否测速无关（无测速时"下载速度"列为空）：
+固定 9 列，与是否测速无关（禁用下载测速 `-speedtest 0` 时"下载速度"列为空）：
 
 ```csv
-IP地址,端口号,网络延迟,下载速度,国家,国家代码,数据中心,出站IP,ASN组织
-104.16.1.1,443,42 ms,12.34 MB/s,美国,US,LAX,104.16.1.1,"Cloudflare, Inc."
-104.16.2.2,443,48 ms,8.91 MB/s,美国,US,SJC,104.16.2.2,"Cloudflare, Inc."
+IP地址,端口号,网络延迟ms,下载速度,国家,国家代码,数据中心,出站IP,ASN组织
+104.16.1.1,443,42,12.34 MB/s,美国,US,LAX,104.16.1.1,"Cloudflare, Inc."
+104.16.2.2,443,48,8.91 MB/s,美国,US,SJC,104.16.2.2,"Cloudflare, Inc."
 ```
 
 | 列 | 来源 | 说明 |
 |----|------|------|
 | IP地址 | 输入 | 待测 IP |
 | 端口号 | 输入 | 待测端口 |
-| 网络延迟 | TCP 握手 | 单位 ms |
+| 网络延迟ms | TCP 握手 | 纯整数毫秒（不带 `ms` 后缀） |
 | 下载速度 | 下载测速 | 单位 **MB/s**，保留两位小数 |
 | 国家 | probe.Country | 中文名（如"美国"） |
 | 国家代码 | probe.Country | ISO 3166-1 alpha-2（如"US"） |
@@ -529,14 +585,14 @@ IP地址,端口号,网络延迟,下载速度,国家,国家代码,数据中心,�
 ### 历史归档文件 `bestip.csv`
 
 - 无表头，每段前有 `# 时间` 注释行
-- 数据列与 `ip.csv` 相同，唯**网络延迟为纯整数毫秒**（不带 ` ms`）
+- 数据列与 `ip.csv` 完全一致（9 列，延迟为纯整数毫秒）
 - 追加写入，跨多次运行累积
 - 可通过 `history_limit` 限制最大行数，自动裁剪较早数据
 
 ### 订阅文件
 
 - `sub_config.output_dir` 目录下，文件名由 `file_name` 指定
-- 默认 **base64 编码**（`b64encode: true`）
+- 默认 **Base64 编码**（`b64encode: true`）
 - 每个模板生成一个独立文件
 
 ---
@@ -582,25 +638,25 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
 
 **MB/s**。例如想找到速度 ≥ 2 MB/s 的 IP，请设 `min_speed: 2` 或 `-minspeed 2`。
 
-### Q: `-urls` 支持本地文件吗？
+### Q: `-sources` 支持本地文件吗？
 
-支持。三种写法均可：
+支持。多种写法可混合使用：
 
 ```bash
-./iptest -urls "file:///opt/iptest/all.txt"
-./iptest -urls "/opt/iptest/all.txt"
-./iptest -urls "https://sub.example.com/a.txt,file:///opt/iptest/local.txt"
+./iptest -sources "file:///opt/iptest/all.txt"
+./iptest -sources "/opt/iptest/all.txt"
+./iptest -sources "https://sub.example.com/a.txt,file:///opt/iptest/local.txt"
 ```
 
 本地文件不走代理，直接读取磁盘；即使配置了 `proxy` 也不影响。
 
 ### Q: 历史归档文件能直接作为输入源复用吗？
 
-可以。历史文件每段前的 `# 时间` 是注释行，`extractIPsLikeAwk` 解析时会自动忽略。直接把路径加入 `urls` 即可：
+可以。历史文件每段前的 `# 时间` 是注释行，提取解析时会自动忽略。直接把路径加入 `sources` 即可：
 
 ```jsonc
 {
-  "urls": "file:///opt/iptest/history/bestip.csv"
+  "sources": ["file:///opt/iptest/history/bestip.csv"]
 }
 ```
 
@@ -611,10 +667,6 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
 ### Q: 裁剪会破坏 `# 时间` 段的完整性吗？
 
 不会。裁剪以"段"为单位（`# 时间` 行 + 其下数据行）。当某段的数据行全被删光时，其 `# 时间` 注释行也会一并删除，不会留下孤立注释。
-
-### Q: `-file` / `-outfile` / `-history` 支持带目录的路径吗？
-
-支持相对和绝对路径。写出时父目录不存在会自动创建（`MkdirAll`）。仅当 `-file` 由用户直接提供但文件缺失时报错（缺少输入源）。
 
 ### Q: 配置文件放在哪？
 
@@ -634,15 +686,15 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
 .\iptest.exe
 ```
 
-### Q: 为什么 Linux 启动时打印"正在尝试提升文件描述符的上限"？
+### Q: 为什么 Linux 启动时打印"提升文件描述符上限时出现错误"？
 
-测速需要大量并发连接，会自动执行 `ulimit -n 10000`。失败不影响运行，仅在高并发时可能受限。可在 `/etc/security/limits.conf` 手动调高。
+测速需要大量并发连接，程序会自动尝试执行 `ulimit -n 10000`。若非 root 权限运行可能会失败，但不影响主程序运行（仅在极高并发时可能受限）。可在 `/etc/security/limits.conf` 手动调高。
 
 ---
 
 ## 注意事项
 
-1. **代理仅覆盖 urls 远程下载和 DNS 推送**：测速过程一定直连（否则测速结果无意义）；urls 读取本地文件也不走代理。
+1. **代理仅覆盖 `sources` 远程下载和 DNS 推送**：测速过程一定直连（否则测速结果无意义）；`sources` 读取本地文件也不走代理。
 2. **UPX 压缩的 Windows 二进制可能被部分杀毒软件误报**：这是 UPX 的常见现象，如有顾虑可自行去掉 UPX 压缩。
 3. **macOS 二进制未签名**：首次运行可能提示"无法验证开发者"，执行：
    ```bash
@@ -650,10 +702,9 @@ CGO_ENABLED=0 GOOS=windows GOARCH=amd64 \
    ```
    或 **系统设置 → 隐私与安全性 → 仍要打开**。
 4. **Cloudflare 免费账户 TTL 最小值 60 秒**：`ttl=1` 表示自动（300s）。
-5. **probe.609909.xyz 为第三方服务**：介意隐私或服务稳定性请自行更换探测源。
-6. **`urls` 逗号分隔**：如果本地路径本身含逗号（如 `/data/a,b.txt`），建议用 `file:///data/a%2Cb.txt` 形式（URL 解析会自动还原 `%2C` → `,`）。
-7. **`history_limit` 建议不要设为 0**：长期运行会导致归档文件越来越大，影响解析性能。
-8. **请在法律允许的范围内使用本工具**，禁止用于任何未授权的网络攻击或扫描。
+5. **`sources` 逗号分隔**：如果本地路径本身含逗号（如 `/data/a,b.txt`），建议用 `file:///data/a%2Cb.txt` 形式（URL 解析会自动还原 `%2C` → `,`）。
+6. **`history_limit` 建议不要设为 0**：长期运行会导致归档文件越来越大，影响解析性能。
+7. **请在法律允许的范围内使用本工具**，禁止用于任何未授权的网络攻击或扫描。
 
 ---
 
