@@ -40,7 +40,6 @@ var (
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=20000000", "测速文件地址")
 	delay        = flag.Int("delay", 0, "延迟阈值(ms), 默认为0禁用延迟过滤")
 
-	// 输入源：合并了原 file 与 urls
 	flagSources = flag.String("sources", "", "输入源列表（逗号分隔）, 本地文件路径或 URL, 自动识别；显式指定时覆盖配置文件 sources")
 	flagFile    = flag.String("file", "", "输入文件（单个, 兼容旧版；追加到 sources）")
 	flagUrls    = flag.String("urls", "", "输入源列表（逗号分隔, 兼容旧版；追加到 sources）")
@@ -375,7 +374,6 @@ func collectSources(cfg *AppConfig, visited map[string]bool) []string {
 		raw = append(raw, splitURLs(*flagSources)...)
 	} else {
 		raw = append(raw, cfg.Sources...)
-		// 兼容旧配置字段
 		if cfg.File != "" {
 			raw = append(raw, cfg.File)
 		}
@@ -384,7 +382,6 @@ func collectSources(cfg *AppConfig, visited map[string]bool) []string {
 		}
 	}
 
-	// 命令行兼容参数
 	if visited["file"] {
 		raw = append(raw, *flagFile)
 	}
@@ -392,7 +389,6 @@ func collectSources(cfg *AppConfig, visited map[string]bool) []string {
 		raw = append(raw, splitURLs(*flagUrls)...)
 	}
 
-	// 去重
 	seen := make(map[string]bool)
 	var unique []string
 	for _, s := range raw {
@@ -404,7 +400,6 @@ func collectSources(cfg *AppConfig, visited map[string]bool) []string {
 		unique = append(unique, s)
 	}
 
-	// 默认
 	if len(unique) == 0 {
 		unique = []string{"ip.txt"}
 	}
@@ -1103,7 +1098,6 @@ func parseIPsFromContent(content string) []string {
 			continue
 		}
 
-		// 精确匹配 "IP 端口" 格式
 		parts := strings.Fields(line)
 		if len(parts) == 2 {
 			if ip := net.ParseIP(parts[0]); ip != nil {
@@ -1114,7 +1108,6 @@ func parseIPsFromContent(content string) []string {
 			}
 		}
 
-		// 兜底：awk 提取逻辑（只保留 443）
 		for _, ip := range extractIPsLikeAwk(line) {
 			add(ip + " 443")
 		}

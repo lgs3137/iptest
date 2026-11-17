@@ -52,9 +52,7 @@
 ├── subscription.go   # 订阅文件生成
 ├── dns.go            # Cloudflare DNS 推送
 ├── config.json       # 配置文件（首次运行自动生成）
-├── ip.csv            # 测速结果（固定 9 列）
-├── bestip.csv        # 历史最优归档（可选，需开启 history_enable）
-└── html/             # 订阅输出目录
+└── html/             # 资源目录
 ```
 
 ---
@@ -112,7 +110,7 @@
 
 ### 3. 查看结果
 
-- 测速结果：`ip.csv`
+- 测速结果：`result.csv`
 - 历史归档：`bestip.csv`（开启后）
 - 订阅文件：`html/` 目录下的 `.txt` 文件（默认 base64 编码）
 
