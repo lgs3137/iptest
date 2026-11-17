@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type DNSConfig struct {
@@ -71,7 +72,8 @@ func createOrUpdateCFRecord(name, ip, recordType string, cfg DNSConfig) error {
 	if ttl == 0 {
 		ttl = 300
 	}
-	client := &http.Client{}
+
+	client := newOutboundHTTPClient(30 * time.Second)
 
 	searchURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s&type=%s", zoneID, name, recordType)
 	reqSearch, err := http.NewRequest("GET", searchURL, nil)

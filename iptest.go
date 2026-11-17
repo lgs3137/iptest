@@ -35,8 +35,8 @@ const (
 )
 
 var (
-	File         = flag.String("file", "ip.txt", "IP地址文件名称,格式为 ip port")
-	outFile      = flag.String("outfile", "ip.csv", "输出文件名称")
+	File         = flag.String("file", "ip.txt", "IP地址文件名称, 支持路径, 格式为 ip port")
+	outFile      = flag.String("outfile", "ip.csv", "输出文件名称, 支持路径")
 	maxThreads   = flag.Int("max", 100, "并发请求最大协程数")
 	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
 	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=20000000", "测速文件地址")
@@ -44,12 +44,18 @@ var (
 
 	flagSub  = flag.Bool("sub", false, "只读取测速结果文件生成订阅")
 	flagDns  = flag.Bool("dns", false, "只读取测速结果文件推送 DNS")
-	flagUrls = flag.String("urls", "", "递归下载 URL 列表中的 IP 作为测速输入, 逗号分隔")
+	flagUrls = flag.String("urls", "", "递归下载 URL 列表中的 IP 作为测速输入, 逗号分隔; 支持 file:// 或裸本地路径")
 
 	proxyFlag = flag.String("proxy", "", "代理地址, 例如 socks5://127.0.0.1:10808, 为空则直连; 仅用于 urls 下载与 DNS 推送")
 
 	minSpeed      = flag.Float64("minspeed", 0, "下载速度合格指标(MB/s), 0为不限制, 例如2表示2MB/s, 支持小数如1.5")
 	minSpeedCount = flag.Int("minspeedcount", 0, "达到合格速度的IP数量限制, 达到后提前停止测速, 0为不限制")
+
+	// 历史最优归档
+	flagHistoryEnable = flag.Bool("historyenable", false, "启用历史最优归档")
+	flagHistory       = flag.String("history", "", "历史最优归档文件, 例如 bestip.csv")
+	flagHistoryCount  = flag.Int("historycount", 3, "每次归档的排名数量, 默认 3")
+	flagHistoryLimit  = flag.Int("historylimit", 1000, "历史归档文件最大数据行数, 超出后清理较早数据; 0 表示不限制")
 )
 
 var (
@@ -67,7 +73,6 @@ func initProxy(raw string) bool {
 		fmt.Printf("[proxy] 解析代理地址失败: %v\n", err)
 		return false
 	}
-
 	testTr := &http.Transport{Proxy: http.ProxyURL(u)}
 	client := &http.Client{Transport: testTr, Timeout: 10 * time.Second}
 	req, _ := http.NewRequest("GET", probeURL, nil)
@@ -82,12 +87,10 @@ func initProxy(raw string) bool {
 	statusCode := resp.StatusCode
 	resp.Body.Close()
 	testTr.CloseIdleConnections()
-
 	if !statusOK {
 		fmt.Printf("[proxy] 代理请求 probe 返回 %d, 将直连\n", statusCode)
 		return false
 	}
-
 	fmt.Printf("[proxy] 代理可用: %s ; 后续 urls 下载与 dns 推送走代理\n", raw)
 	proxyURL = u
 	proxyActive = true
@@ -95,11 +98,11 @@ func initProxy(raw string) bool {
 	return true
 }
 
-func newOutboundHTTPClient(timeout time.Duration) *http.Client {
+func newOutboundHTTPClient(t time.Duration) *http.Client {
 	if proxyActive && proxyTransport != nil {
-		return &http.Client{Transport: proxyTransport, Timeout: timeout}
+		return &http.Client{Transport: proxyTransport, Timeout: t}
 	}
-	return &http.Client{Timeout: timeout}
+	return &http.Client{Timeout: t}
 }
 
 type AppConfig struct {
@@ -113,6 +116,10 @@ type AppConfig struct {
 	Delay         int       `json:"delay"`
 	MinSpeed      float64   `json:"min_speed"`
 	MinSpeedCount int       `json:"min_speed_count"`
+	HistoryEnable bool      `json:"history_enable"`
+	History       string    `json:"history"`
+	HistoryCount  int       `json:"history_count"`
+	HistoryLimit  int       `json:"history_limit"`
 	SubConfig     SubConfig `json:"sub_config"`
 	DNSConfig     DNSConfig `json:"dns_config"`
 }
@@ -140,6 +147,10 @@ func generateDefaultConfig(path string) error {
 		Delay:         0,
 		MinSpeed:      0,
 		MinSpeedCount: 0,
+		HistoryEnable: false,
+		History:       "",
+		HistoryCount:  3,
+		HistoryLimit:  1000,
 		SubConfig: SubConfig{
 			Enabled:     false,
 			OutputDir:   "./html",
@@ -229,6 +240,20 @@ func applyConfig(cfg *AppConfig, visited map[string]bool) {
 	}
 	if !visited["proxy"] && cfg.Proxy != "" {
 		*proxyFlag = cfg.Proxy
+	}
+	if !visited["historyenable"] {
+		*flagHistoryEnable = cfg.HistoryEnable
+	}
+	if !visited["history"] && cfg.History != "" {
+		*flagHistory = cfg.History
+	}
+	if !visited["historycount"] && cfg.HistoryCount > 0 {
+		*flagHistoryCount = cfg.HistoryCount
+	}
+	if !visited["historylimit"] {
+		if cfg.HistoryLimit >= 0 {
+			*flagHistoryLimit = cfg.HistoryLimit
+		}
 	}
 }
 
@@ -403,7 +428,7 @@ func main() {
 		fmt.Printf("已从 URL 提取 %d 个 IP 写入 %s\n", len(ips), *File)
 	}
 
-	runSpeedtest()
+	runSpeedtest(cfg)
 
 	if cfg.SubConfig.Enabled {
 		fmt.Println("[sub] 测速完成, 开始生成订阅...")
@@ -415,7 +440,7 @@ func main() {
 	}
 }
 
-func runSpeedtest() {
+func runSpeedtest(cfg *AppConfig) {
 	var validCount int32
 	startTime := time.Now()
 	osType := runtime.GOOS
@@ -580,6 +605,13 @@ func runSpeedtest() {
 		})
 	}
 
+	if dir := filepath.Dir(*outFile); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Printf("创建输出目录失败 [%s]: %v\n", dir, err)
+			return
+		}
+	}
+
 	file, err := os.Create(*outFile)
 	if err != nil {
 		fmt.Printf("无法创建文件: %v\n", err)
@@ -612,8 +644,169 @@ func runSpeedtest() {
 	}
 	writer.Flush()
 
+	if *speedTest > 0 && len(results) > 0 && cfg.HistoryEnable && cfg.History != "" {
+		if err := appendHistory(results, cfg, time.Now()); err != nil {
+			fmt.Printf("[history] 归档失败: %v\n", err)
+		}
+	}
+
 	fmt.Printf("有效IP数量: %d | 成功将结果写入文件 %s，耗时 %d秒\n",
 		atomic.LoadInt32(&validCount), *outFile, time.Since(startTime)/time.Second)
+}
+
+func appendHistory(results []speedtestresult, cfg *AppConfig, ts time.Time) error {
+	count := cfg.HistoryCount
+	if count <= 0 {
+		count = 3
+	}
+	if count > len(results) {
+		count = len(results)
+	}
+
+	if dir := filepath.Dir(cfg.History); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("创建历史文件目录失败 [%s]: %v", dir, err)
+		}
+	}
+
+	f, err := os.OpenFile(cfg.History, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return fmt.Errorf("打开历史文件失败 [%s]: %v", cfg.History, err)
+	}
+
+	if _, err := fmt.Fprintf(f, "# %s\n", ts.Format("2006-01-02 15:04:05")); err != nil {
+		f.Close()
+		return err
+	}
+
+	cw := csv.NewWriter(f)
+	for i := 0; i < count; i++ {
+		res := results[i]
+		cw.Write([]string{
+			res.result.ip,
+			strconv.Itoa(res.result.port),
+			strconv.FormatInt(res.result.tcpDuration.Milliseconds(), 10),
+			fmt.Sprintf("%.2f MB/s", res.downloadSpeed),
+			res.result.country,
+			res.result.countryCode,
+			res.result.dataCenter,
+			res.result.outboundIP,
+			res.result.asnOrg,
+		})
+	}
+	cw.Flush()
+	if err := cw.Error(); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+
+	fmt.Printf("[history] 已归档前 %d 个结果到 %s\n", count, cfg.History)
+
+	if cfg.HistoryLimit > 0 {
+		removed, err := trimHistory(cfg.History, cfg.HistoryLimit)
+		if err != nil {
+			fmt.Printf("[history] 清理历史文件失败: %v\n", err)
+		} else if removed > 0 {
+			fmt.Printf("[history] 历史文件已超出 %d 行上限, 清理较早数据 %d 行\n", cfg.HistoryLimit, removed)
+		}
+	}
+	return nil
+}
+
+func trimHistory(path string, limit int) (int, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+
+	type segment struct {
+		header string
+		rows   []string
+	}
+
+	var segs []segment
+	var cur segment
+	total := 0
+
+	flush := func() {
+		if cur.header != "" || len(cur.rows) > 0 {
+			segs = append(segs, cur)
+		}
+		cur = segment{}
+	}
+
+	for _, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimRight(raw, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if strings.HasPrefix(trimmed, "#") {
+			flush()
+			cur.header = line
+			continue
+		}
+		cur.rows = append(cur.rows, line)
+		total++
+	}
+	flush()
+
+	if total <= limit {
+		return 0, nil
+	}
+
+	need := total - limit
+	removed := 0
+
+	for i := range segs {
+		if need <= 0 {
+			break
+		}
+		n := len(segs[i].rows)
+		if n == 0 {
+			continue
+		}
+		if n <= need {
+			need -= n
+			removed += n
+			segs[i].rows = nil
+			segs[i].header = ""
+		} else {
+			segs[i].rows = segs[i].rows[need:]
+			removed += need
+			need = 0
+		}
+	}
+
+	var sb strings.Builder
+	for _, s := range segs {
+		if len(s.rows) == 0 {
+			continue
+		}
+		if s.header != "" {
+			sb.WriteString(s.header)
+			sb.WriteByte('\n')
+		}
+		for _, r := range s.rows {
+			sb.WriteString(r)
+			sb.WriteByte('\n')
+		}
+	}
+
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, []byte(sb.String()), 0644); err != nil {
+		return removed, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return removed, err
+	}
+	return removed, nil
 }
 
 func probeIP(ipAddr string, port int) (*probeResponse, error) {
@@ -716,7 +909,58 @@ func splitURLs(s string) []string {
 	return out
 }
 
+func fileURLToPath(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("解析 file URL 失败: %v", err)
+	}
+	if !strings.EqualFold(u.Scheme, "file") {
+		return "", fmt.Errorf("非 file 协议: %s", rawURL)
+	}
+	path := u.Path
+	if runtime.GOOS == "windows" && len(path) >= 3 && path[0] == '/' && path[2] == ':' {
+		path = path[1:]
+	}
+	if path == "" {
+		return "", fmt.Errorf("file URL 缺少路径: %s", rawURL)
+	}
+	return path, nil
+}
+
+func isLocalSource(rawURL string) bool {
+	lower := strings.ToLower(rawURL)
+	if strings.HasPrefix(lower, "file://") {
+		return true
+	}
+	if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+		return false
+	}
+	return true
+}
+
 func downloadContent(client *http.Client, rawURL string) (string, error) {
+	lower := strings.ToLower(rawURL)
+
+	if strings.HasPrefix(lower, "file://") {
+		path, err := fileURLToPath(rawURL)
+		if err != nil {
+			return "", err
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("读取本地文件失败 [%s]: %v", path, err)
+		}
+		return string(data), nil
+	}
+
+	if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+		data, err := os.ReadFile(rawURL)
+		if err != nil {
+			return "", fmt.Errorf("读取本地文件失败 [%s]: %v", rawURL, err)
+		}
+		return string(data), nil
+	}
+
 	req, err := http.NewRequest("GET", rawURL, nil)
 	if err != nil {
 		return "", err
@@ -762,7 +1006,7 @@ func tryBase64Decode(s string) string {
 }
 
 func extractURLs(s string) []string {
-	re := regexp.MustCompile(`https?://[^\s"'\\<>\r\n]+`)
+	re := regexp.MustCompile(`(?:https?|file)://[^\s"'\\<>\r\n]+`)
 	return re.FindAllString(s, -1)
 }
 
@@ -834,7 +1078,7 @@ func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
 		url   string
 		depth int
 	}
-	client := newOutboundHTTPClient(10 * time.Second)
+	client := newOutboundHTTPClient(20 * time.Second)
 
 	seenURL := make(map[string]bool)
 	enqueued := make(map[string]bool)
@@ -860,11 +1104,15 @@ func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
 		seenURL[t.url] = true
 		downloaded++
 
-		fmt.Printf("[urls] (%d) 请求中 深度=%d: %s\n", downloaded, t.depth, t.url)
+		kind := "请求远程"
+		if isLocalSource(t.url) {
+			kind = "读取本地"
+		}
+		fmt.Printf("[urls] (%d) %s 深度=%d: %s\n", downloaded, kind, t.depth, t.url)
 
 		content, err := downloadContent(client, t.url)
 		if err != nil {
-			fmt.Printf("[urls] 下载失败 [%s]: %v\n", t.url, err)
+			fmt.Printf("[urls] 加载失败 [%s]: %v\n", t.url, err)
 			continue
 		}
 
@@ -902,11 +1150,16 @@ func fetchIPsFromURLs(urls []string, maxDepth int) ([]string, error) {
 		}
 	}
 
-	fmt.Printf("[urls] 递归完成: 共请求 %d 个 URL, 提取唯一 IP 共 %d 个\n", downloaded, len(ipOrder))
+	fmt.Printf("[urls] 递归完成: 共处理 %d 个来源, 提取唯一 IP 共 %d 个\n", downloaded, len(ipOrder))
 	return ipOrder, nil
 }
 
 func writeIPs(fileName string, ips []string) error {
+	if dir := filepath.Dir(fileName); dir != "." && dir != "" {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("创建目录失败 [%s]: %v", dir, err)
+		}
+	}
 	f, err := os.Create(fileName)
 	if err != nil {
 		return err

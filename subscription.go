@@ -134,7 +134,7 @@ func GenerateAllSubscriptions(cfg SubCreateConfig) error {
 
 		if item.Subtype == "domain" {
 			if len(item.PreferredDomains) == 0 {
-				fmt.Printf("警告: 模板 [%s] 的类型为 domain，但未配置 preferred_domains\n", item.FileName)
+				fmt.Printf("警告: 模板 [%s] 的类型为 domain, 但未配置 preferred_domains\n", item.FileName)
 				continue
 			}
 			targetCount = len(item.PreferredDomains)
