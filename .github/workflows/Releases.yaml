@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. v1.0.0). Leave empty to auto-generate.'
+        required: false
+        default: ''
+      prerelease:
+        description: 'Mark as prerelease'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    name: Prepare version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - id: meta
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            V="${{ github.event.inputs.version }}"
+          else
+            V="v$(date -u +%Y%m%d-%H%M%S)"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Release version: $V"
+
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}${{ matrix.goarm }}
+    needs: prepare
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: linux,   goarch: amd64, goarm: ''  }
+          - { goos: linux,   goarch: arm64, goarm: ''  }
+          - { goos: linux,   goarch: arm,   goarm: '7' }
+          - { goos: linux,   goarch: 386,   goarm: ''  }
+          - { goos: windows, goarch: amd64, goarm: ''  }
+          - { goos: windows, goarch: arm64, goarm: ''  }
+          - { goos: windows, goarch: 386,   goarm: ''  }
+          - { goos: darwin,  goarch: amd64, goarm: ''  }
+          - { goos: darwin,  goarch: arm64, goarm: ''  }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+
+      - name: Install UPX
+        run: |
+          set -e
+          UPX_VER=5.3.0
+          wget -q "https://github.com/upx/upx/releases/download/v${UPX_VER}/upx-${UPX_VER}-amd64_linux.tar.xz"
+          tar -xf "upx-${UPX_VER}-amd64_linux.tar.xz"
+          sudo mv "upx-${UPX_VER}-amd64_linux/upx" /usr/local/bin/upx
+          upx --version
+
+      - name: Build, Compress, Package
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          CGO_ENABLED: '0'
+        run: |
+          set -e
+
+          ARCH="${GOARCH}"
+          if [ -n "${GOARM}" ]; then
+            ARCH="${ARCH}v${GOARM}"
+          fi
+
+          OUT="iptest-${VERSION}-${GOOS}-${ARCH}"
+          if [ "${GOOS}" = "windows" ]; then
+            OUT="${OUT}.exe"
+          fi
+
+          echo "::group::Build ${OUT}"
+          go build -trimpath -ldflags "-s -w" -o "$OUT" .
+          ls -lh "$OUT"
+          echo "::endgroup::"
+
+          if [ "${GOOS}" = "linux" ] || [ "${GOOS}" = "windows" ]; then
+            echo "::group::UPX compress ${OUT}"
+            upx --best --lzma "$OUT" || upx --best "$OUT" || echo "UPX failed, keep original"
+            ls -lh "$OUT"
+            echo "::endgroup::"
+          else
+            echo "Skipping UPX for ${GOOS} (code signing issues)"
+          fi
+
+          if [ "${GOOS}" = "windows" ]; then
+            PKG="${OUT%.exe}.zip"
+            zip -q "$PKG" "$OUT"
+          else
+            PKG="${OUT}.tar.gz"
+            tar -czf "$PKG" "$OUT"
+          fi
+          echo "Package: $PKG"
+          ls -lh "$PKG"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.goarm }}
+          path: |
+            *.tar.gz
+            *.zip
+          retention-days: 1
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lhR dist
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.version }}
+          name: ${{ needs.prepare.outputs.version }}
+          prerelease: ${{ github.event.inputs.prerelease == 'true' }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: dist/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
