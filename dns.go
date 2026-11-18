@@ -2,10 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -28,55 +32,125 @@ type CloudflareDNSRecord struct {
 	Proxied bool   `json:"proxied"`
 }
 
-type CFListResponse struct {
-	Success bool `json:"success"`
-	Result  []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"result"`
+type CFError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
 }
 
-func PushToCloudflareDNS(results []SpeedResult, cfg DNSConfig) error {
-	if !cfg.Enabled {
-		return fmt.Errorf("DNS 推送功能未开启")
+type CFRecord struct {
+	ID      string `json:"id"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Content string `json:"content"`
+	TTL     int    `json:"ttl"`
+	Proxied bool   `json:"proxied"`
+}
+
+type CFListResponse struct {
+	Success bool       `json:"success"`
+	Errors  []CFError  `json:"errors"`
+	Result  []CFRecord `json:"result"`
+}
+
+type DNSPlanItem struct {
+	Index   int    `json:"index"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Content string `json:"content"`
+	TTL     int    `json:"ttl"`
+	Proxied bool   `json:"proxied"`
+	Country string `json:"country"`
+}
+
+func cfErrText(errs []CFError) string {
+	var parts []string
+	for _, e := range errs {
+		parts = append(parts, fmt.Sprintf("%d: %s", e.Code, e.Message))
 	}
-	pushCount := cfg.Count
-	if pushCount <= 0 || pushCount > len(results) {
-		pushCount = len(results)
+	if len(parts) == 0 {
+		return "未知错误"
 	}
-	for i := 0; i < pushCount; i++ {
-		res := results[i]
-		index := i + 1
-		parsedIP := net.ParseIP(res.IP)
-		if parsedIP == nil {
-			fmt.Printf("无效的 IP 地址: %s\n", res.IP)
-			continue
-		}
-		recordType := "A"
-		if parsedIP.To4() == nil {
-			recordType = "AAAA"
-		}
-		fullName := strings.ReplaceAll(cfg.DomainTpl, "{index}", fmt.Sprintf("%d", index))
-		if err := createOrUpdateCFRecord(fullName, res.IP, recordType, cfg); err != nil {
-			fmt.Printf("推送 DNS 失败 [%s (%s) -> %s]: %v\n", fullName, recordType, res.IP, err)
-		} else {
-			fmt.Printf("成功推送/更新 DNS: %s (%s) -> %s\n", fullName, recordType, res.IP)
-		}
+	return strings.Join(parts, "; ")
+}
+
+func checkDNSCfg(cfg DNSConfig) error {
+	if strings.TrimSpace(cfg.Token) == "" || strings.TrimSpace(cfg.ZoneID) == "" {
+		return errors.New("未配置 dns_config.token 或 dns_config.zone_id")
 	}
 	return nil
 }
 
-func createOrUpdateCFRecord(name, ip, recordType string, cfg DNSConfig) error {
-	zoneID := cfg.ZoneID
+func PlanDNSRecords(results []SpeedResult, cfg DNSConfig) []DNSPlanItem {
+	n := cfg.Count
+	if n <= 0 || n > len(results) {
+		n = len(results)
+	}
 	ttl := cfg.TTL
-	if ttl == 0 {
+	if ttl <= 0 {
 		ttl = 300
 	}
+	var items []DNSPlanItem
+	for i := 0; i < n; i++ {
+		res := results[i]
+		parsed := net.ParseIP(res.IP)
+		if parsed == nil {
+			continue
+		}
+		rt := "A"
+		if parsed.To4() == nil {
+			rt = "AAAA"
+		}
+		name := replaceTpl(cfg.DomainTpl, map[string]string{
+			"index":       strconv.Itoa(i + 1),
+			"ip":          res.IP,
+			"port":        res.Port,
+			"country":     res.Country,
+			"countrycode": res.CountryCode,
+		})
+		items = append(items, DNSPlanItem{
+			Index: i + 1, Name: name, Type: rt, Content: res.IP,
+			TTL: ttl, Proxied: cfg.Proxied, Country: res.Country,
+		})
+	}
+	return items
+}
 
+func PushToCloudflareDNS(ctx context.Context, results []SpeedResult, cfg DNSConfig) (int, int, error) {
+	if !cfg.Enabled {
+		return 0, 0, errors.New("DNS 推送功能未开启 (dns_config.enabled=false)")
+	}
+	if err := checkDNSCfg(cfg); err != nil {
+		return 0, 0, err
+	}
+	items := PlanDNSRecords(results, cfg)
+	setPhase("dns", "推送 DNS", len(items))
+	pushed, failed := 0, 0
+	for i, it := range items {
+		if ctx.Err() != nil {
+			return pushed, failed, ctx.Err()
+		}
+		if err := createOrUpdateCFRecord(ctx, it.Name, it.Content, it.Type, cfg); err != nil {
+			failed++
+			logErrf("[dns] 推送失败 [%s (%s) -> %s]: %v", it.Name, it.Type, it.Content, err)
+		} else {
+			pushed++
+			logOkf("[dns] 成功推送/更新: %s (%s) -> %s", it.Name, it.Type, it.Content)
+		}
+		setProgress(i+1, len(items))
+	}
+	logf("[dns] 推送完成: 成功 %d, 失败 %d", pushed, failed)
+	return pushed, failed, nil
+}
+
+func createOrUpdateCFRecord(ctx context.Context, name, ip, recordType string, cfg DNSConfig) error {
+	ttl := cfg.TTL
+	if ttl <= 0 {
+		ttl = 300
+	}
 	client := newOutboundHTTPClient(30 * time.Second)
-
-	searchURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s&type=%s", zoneID, name, recordType)
-	reqSearch, err := http.NewRequest("GET", searchURL, nil)
+	searchURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s&type=%s",
+		cfg.ZoneID, url.QueryEscape(name), recordType)
+	reqSearch, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return err
 	}
@@ -85,27 +159,27 @@ func createOrUpdateCFRecord(name, ip, recordType string, cfg DNSConfig) error {
 	if err != nil {
 		return err
 	}
-	defer respSearch.Body.Close()
-
 	var listResp CFListResponse
-	if err := json.NewDecoder(respSearch.Body).Decode(&listResp); err != nil {
-		return fmt.Errorf("解析 Cloudflare 查询响应失败: %v", err)
+	decErr := json.NewDecoder(respSearch.Body).Decode(&listResp)
+	respSearch.Body.Close()
+	if decErr != nil {
+		return fmt.Errorf("解析 Cloudflare 查询响应失败: %v", decErr)
+	}
+	if !listResp.Success {
+		return fmt.Errorf("查询记录失败: %s", cfErrText(listResp.Errors))
 	}
 
 	record := CloudflareDNSRecord{Type: recordType, Name: name, Content: ip, TTL: ttl, Proxied: cfg.Proxied}
 	body, _ := json.Marshal(record)
-
 	var apiURL, method string
-	if listResp.Success && len(listResp.Result) > 0 {
-		recordID := listResp.Result[0].ID
-		apiURL = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", zoneID, recordID)
+	if len(listResp.Result) > 0 {
+		apiURL = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", cfg.ZoneID, listResp.Result[0].ID)
 		method = "PUT"
 	} else {
-		apiURL = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", zoneID)
+		apiURL = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records", cfg.ZoneID)
 		method = "POST"
 	}
-
-	req, err := http.NewRequest(method, apiURL, bytes.NewBuffer(body))
+	req, err := http.NewRequestWithContext(ctx, method, apiURL, bytes.NewBuffer(body))
 	if err != nil {
 		return err
 	}
@@ -115,8 +189,75 @@ func createOrUpdateCFRecord(name, ip, recordType string, cfg DNSConfig) error {
 		return err
 	}
 	defer resp.Body.Close()
+	var wr struct {
+		Success bool      `json:"success"`
+		Errors  []CFError `json:"errors"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&wr)
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("Cloudflare API 返回状态码异常: %d", resp.StatusCode)
+		return fmt.Errorf("Cloudflare API 状态码 %d: %s", resp.StatusCode, cfErrText(wr.Errors))
+	}
+	if !wr.Success {
+		return fmt.Errorf("Cloudflare API 返回失败: %s", cfErrText(wr.Errors))
+	}
+	return nil
+}
+
+func ListCFRecords(cfg DNSConfig, name string) ([]CFRecord, error) {
+	if err := checkDNSCfg(cfg); err != nil {
+		return nil, err
+	}
+	u := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?per_page=100", cfg.ZoneID)
+	if strings.TrimSpace(name) != "" {
+		u += "&name=" + url.QueryEscape(strings.TrimSpace(name))
+	}
+	client := newOutboundHTTPClient(30 * time.Second)
+	req, err := http.NewRequest("GET", u, nil)
+	if err != nil {
+		return nil, err
+	}
+	setCFAuthHeaders(req, cfg)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	var lr CFListResponse
+	if err := json.NewDecoder(resp.Body).Decode(&lr); err != nil {
+		return nil, fmt.Errorf("解析 Cloudflare 响应失败: %v", err)
+	}
+	if !lr.Success {
+		return nil, fmt.Errorf("查询失败: %s", cfErrText(lr.Errors))
+	}
+	return lr.Result, nil
+}
+
+func DeleteCFRecord(cfg DNSConfig, id string) error {
+	if err := checkDNSCfg(cfg); err != nil {
+		return err
+	}
+	if strings.TrimSpace(id) == "" {
+		return errors.New("缺少记录 ID")
+	}
+	u := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", cfg.ZoneID, id)
+	client := newOutboundHTTPClient(30 * time.Second)
+	req, err := http.NewRequest("DELETE", u, nil)
+	if err != nil {
+		return err
+	}
+	setCFAuthHeaders(req, cfg)
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	var wr struct {
+		Success bool      `json:"success"`
+		Errors  []CFError `json:"errors"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&wr)
+	if !wr.Success {
+		return fmt.Errorf("删除失败(%d): %s", resp.StatusCode, cfErrText(wr.Errors))
 	}
 	return nil
 }
@@ -124,21 +265,4 @@ func createOrUpdateCFRecord(name, ip, recordType string, cfg DNSConfig) error {
 func setCFAuthHeaders(req *http.Request, cfg DNSConfig) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+cfg.Token)
-}
-
-func runDnsOnly(cfg *AppConfig) {
-	if !cfg.DNSConfig.Enabled {
-		fmt.Println("[dns] DNS 推送未开启 (dns_config.enabled=false)")
-		return
-	}
-	results, err := loadSpeedResultsFromFile(*outFile)
-	if err != nil {
-		fmt.Printf("[dns] 加载测速结果失败: %v\n", err)
-		return
-	}
-	if err := PushToCloudflareDNS(results, cfg.DNSConfig); err != nil {
-		fmt.Printf("[dns] 推送 DNS 失败: %v\n", err)
-	} else {
-		fmt.Println("[dns] DNS 推送流程执行完毕！")
-	}
 }

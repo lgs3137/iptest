@@ -2,5 +2,5 @@ html/
 ip.txt
 ip.csv
 ip_*.txt
-config.json
+config.json*
 iptest

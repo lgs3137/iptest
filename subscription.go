@@ -4,9 +4,11 @@ import (
 	"encoding/base64"
 	"encoding/csv"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -39,6 +41,17 @@ type SpeedResult struct {
 	CountryCode string
 }
 
+type SubFileResult struct {
+	Kind     string   `json:"kind"`
+	FileName string   `json:"file_name"`
+	Path     string   `json:"path"`
+	Count    int      `json:"count"`
+	Encoded  bool     `json:"encoded"`
+	Nodes    []string `json:"nodes"`
+	Written  bool     `json:"written"`
+	Error    string   `json:"error,omitempty"`
+}
+
 var tplVarRe = regexp.MustCompile(`\{([A-Za-z_]+)\}`)
 
 func replaceTpl(tpl string, vars map[string]string) string {
@@ -52,50 +65,56 @@ func replaceTpl(tpl string, vars map[string]string) string {
 }
 
 func loadSpeedResultsFromFile(fileName string) ([]SpeedResult, error) {
-	if fileName == "" {
-		fileName = "ip.csv"
+	if strings.TrimSpace(fileName) == "" {
+		fileName = "html/result.csv"
 	}
-	file, err := os.Open(fileName)
+	f, err := os.Open(fileName)
 	if err != nil {
 		return nil, fmt.Errorf("无法打开测速结果文件 %s: %v", fileName, err)
 	}
-	defer file.Close()
-
-	reader := csv.NewReader(file)
+	defer f.Close()
+	reader := csv.NewReader(f)
+	reader.FieldsPerRecord = -1
+	reader.Comment = '#'
+	reader.LazyQuotes = true
 	records, err := reader.ReadAll()
 	if err != nil {
 		return nil, fmt.Errorf("解析 CSV 文件失败: %v", err)
 	}
-
 	var results []SpeedResult
 	for i, record := range records {
 		if len(record) == 0 {
 			continue
 		}
-		firstCol := strings.TrimSpace(record[0])
-		if i == 0 && (strings.Contains(strings.ToLower(firstCol), "ip") || strings.Contains(strings.ToLower(firstCol), "address")) {
+		first := strings.TrimSpace(strings.TrimPrefix(record[0], "\ufeff"))
+		if first == "" {
 			continue
 		}
-		ip := firstCol
-		if ip == "" {
+		low := strings.ToLower(first)
+		if i == 0 && (strings.Contains(low, "ip") || strings.Contains(low, "address") || strings.Contains(first, "地址")) {
+			continue
+		}
+		if net.ParseIP(first) == nil {
 			continue
 		}
 		port := "443"
-		if len(record) > 1 && strings.TrimSpace(record[1]) != "" {
-			port = strings.TrimSpace(record[1])
+		if len(record) > 1 {
+			p := strings.TrimSpace(record[1])
+			if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= 65535 {
+				port = strconv.Itoa(n)
+			}
 		}
-		country := ""
+		country, code := "", ""
 		if len(record) > 4 {
 			country = strings.TrimSpace(record[4])
 		}
-		countryCode := ""
 		if len(record) > 5 {
-			countryCode = strings.TrimSpace(record[5])
+			code = strings.TrimSpace(record[5])
 		}
-		results = append(results, SpeedResult{IP: ip, Port: port, Country: country, CountryCode: countryCode})
+		results = append(results, SpeedResult{IP: first, Port: port, Country: country, CountryCode: code})
 	}
 	if len(results) == 0 {
-		return nil, fmt.Errorf("测速结果为空或未能成功提取有效IP")
+		return nil, fmt.Errorf("测速结果为空或未能成功提取有效IP (%s)", fileName)
 	}
 	return results, nil
 }
@@ -109,33 +128,25 @@ func writeSubFile(outputDir, fileName string, nodes []string, b64 bool) error {
 	if b64 {
 		content = base64.StdEncoding.EncodeToString([]byte(content))
 	}
-	filePath := filepath.Join(outputDir, fileName)
-	return os.WriteFile(filePath, []byte(content), 0644)
+	return os.WriteFile(filepath.Join(outputDir, fileName), []byte(content), 0644)
 }
 
-func GenerateAllSubscriptions(cfg SubCreateConfig) error {
+func BuildSubscriptions(cfg SubCreateConfig) ([]SubFileResult, error) {
 	if !cfg.Sub.Enabled {
-		return fmt.Errorf("订阅生成功能未开启")
+		return nil, fmt.Errorf("订阅生成功能未开启 (sub_config.enabled=false)")
 	}
-
 	results, err := LoadSpeedResults(cfg)
 	if err != nil {
-		return err
+		return nil, err
 	}
-
 	outputDir := cfg.Sub.OutputDir
 	if outputDir == "" {
 		outputDir = "html/"
 	}
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("创建订阅目录失败: %v", err)
-	}
-
 	nameTpl := cfg.Sub.NodeNameTpl
 	if nameTpl == "" {
 		nameTpl = "{index}{country}{ip}"
 	}
-
 	subtypes := cfg.Sub.Subtype
 	if len(subtypes) == 0 {
 		if len(cfg.Sub.PreferredDomains) > 0 {
@@ -144,85 +155,100 @@ func GenerateAllSubscriptions(cfg SubCreateConfig) error {
 			subtypes = []string{"ip"}
 		}
 	}
-	hasIP := false
-	hasDomain := false
+	hasIP, hasDomain := false, false
 	for _, st := range subtypes {
-		st = strings.ToLower(strings.TrimSpace(st))
-		if st == "ip" {
+		switch strings.ToLower(strings.TrimSpace(st)) {
+		case "ip":
 			hasIP = true
-		}
-		if st == "domain" {
+		case "domain":
 			hasDomain = true
 		}
 	}
+	if len(cfg.Sub.Templates) == 0 {
+		return nil, fmt.Errorf("未配置订阅模板 (sub_config.templates)")
+	}
 
+	var out []SubFileResult
 	for _, item := range cfg.Sub.Templates {
 		tplLower := strings.ToLower(item.Template)
 		tplHasIP := strings.Contains(tplLower, "{ip}")
 		tplHasDomain := strings.Contains(tplLower, "{domain}")
 
 		if hasIP && tplHasIP && item.IPFileName != "" {
-			var nodes []string
 			targetCount := len(results)
 			if cfg.Sub.Count > 0 && cfg.Sub.Count < targetCount {
 				targetCount = cfg.Sub.Count
 			}
+			var nodes []string
 			for i := 0; i < targetCount; i++ {
-				index := i + 1
 				res := results[i%len(results)]
-				nodeName := replaceTpl(nameTpl, map[string]string{
-					"ip":          res.IP,
-					"port":        res.Port,
-					"index":       fmt.Sprintf("%d", index),
+				vars := map[string]string{
+					"ip": res.IP, "port": res.Port,
+					"index":       strconv.Itoa(i + 1),
 					"country":     res.Country,
 					"countrycode": res.CountryCode,
-				})
-				node := replaceTpl(item.Template, map[string]string{
-					"ip":            res.IP,
-					"domain":        "",
-					"port":          res.Port,
-					"node_name_tpl": nodeName,
-				})
-				nodes = append(nodes, node)
+					"domain":      "",
+				}
+				vars["node_name_tpl"] = replaceTpl(nameTpl, vars)
+				nodes = append(nodes, replaceTpl(item.Template, vars))
 			}
-			if err := writeSubFile(outputDir, item.IPFileName, nodes, cfg.Sub.B64Encode); err != nil {
-				fmt.Printf("写入订阅文件失败 [%s]: %v\n", item.IPFileName, err)
-			} else {
-				fmt.Printf("订阅文件生成成功: %s (共生成 %d 个节点)\n", filepath.Join(outputDir, item.IPFileName), len(nodes))
-			}
+			out = append(out, SubFileResult{
+				Kind: "ip", FileName: item.IPFileName,
+				Path: filepath.Join(outputDir, item.IPFileName),
+				Count: len(nodes), Encoded: cfg.Sub.B64Encode, Nodes: nodes,
+			})
 		}
 
 		if hasDomain && tplHasDomain && item.DomainFileName != "" && len(cfg.Sub.PreferredDomains) > 0 {
 			var nodes []string
 			for i, domain := range cfg.Sub.PreferredDomains {
 				res := results[i%len(results)]
-				node := replaceTpl(item.Template, map[string]string{
-					"ip":            "",
-					"domain":        domain,
-					"port":          res.Port,
-					"node_name_tpl": domain,
-				})
-				nodes = append(nodes, node)
+				nodeName := domain
+				if strings.Contains(strings.ToLower(nameTpl), "{domain}") {
+					nodeName = replaceTpl(nameTpl, map[string]string{
+						"domain": domain, "index": strconv.Itoa(i + 1),
+						"ip": res.IP, "port": res.Port,
+						"country": res.Country, "countrycode": res.CountryCode,
+					})
+				}
+				nodes = append(nodes, replaceTpl(item.Template, map[string]string{
+					"ip": "", "domain": domain, "port": res.Port, "node_name_tpl": nodeName,
+				}))
 			}
-			if err := writeSubFile(outputDir, item.DomainFileName, nodes, cfg.Sub.B64Encode); err != nil {
-				fmt.Printf("写入订阅文件失败 [%s]: %v\n", item.DomainFileName, err)
-			} else {
-				fmt.Printf("订阅文件生成成功: %s (共生成 %d 个节点)\n", filepath.Join(outputDir, item.DomainFileName), len(nodes))
-			}
+			out = append(out, SubFileResult{
+				Kind: "domain", FileName: item.DomainFileName,
+				Path: filepath.Join(outputDir, item.DomainFileName),
+				Count: len(nodes), Encoded: cfg.Sub.B64Encode, Nodes: nodes,
+			})
 		}
 	}
-	return nil
+	if len(out) == 0 {
+		return nil, fmt.Errorf("没有匹配的订阅模板: 请检查 subtype 与模板中的 {ip}/{domain} 占位符")
+	}
+	return out, nil
 }
 
-func runSubOnly(cfg *AppConfig) {
-	subCfg := SubCreateConfig{OutFile: *outFile, Sub: cfg.SubConfig}
-	if !subCfg.Sub.Enabled {
-		fmt.Println("[sub] 订阅生成未开启 (sub_config.enabled=false)")
-		return
+func GenerateAllSubscriptions(cfg SubCreateConfig) ([]SubFileResult, error) {
+	files, err := BuildSubscriptions(cfg)
+	if err != nil {
+		return nil, err
 	}
-	if err := GenerateAllSubscriptions(subCfg); err != nil {
-		fmt.Printf("[sub] 生成订阅失败: %v\n", err)
-	} else {
-		fmt.Println("[sub] 订阅文件生成完成！")
+	outputDir := cfg.Sub.OutputDir
+	if outputDir == "" {
+		outputDir = "html/"
 	}
+	if err := os.MkdirAll(outputDir, 0755); err != nil {
+		return files, fmt.Errorf("创建订阅目录失败: %v", err)
+	}
+	for i := range files {
+		f := &files[i]
+		if err := writeSubFile(outputDir, f.FileName, f.Nodes, cfg.Sub.B64Encode); err != nil {
+			f.Error = err.Error()
+			logErrf("[sub] 写入订阅文件失败 [%s]: %v", f.FileName, err)
+			continue
+		}
+		f.Written = true
+		logOkf("[sub] 订阅文件生成成功: %s (%d 个节点, base64=%v)", f.Path, f.Count, f.Encoded)
+	}
+	return files, nil
 }
