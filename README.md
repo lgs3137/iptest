@@ -162,7 +162,7 @@ go build -trimpath -ldflags "-s -w" -o iptest .
 | 工具 | 输入源解析预览、代理测试（默认应用）、单 IP 探测 + 测速 |
 | 日志 | 全量日志、级别与关键字过滤、debug 开关、导出 |
 
-**鉴权与反代**：`password` 非空即启用 Basic Auth。设置 `path_prefix` 后，页面 `/iptest/`、接口 `/iptest/api/*`、订阅 `/iptest/sub/xxx.txt`，其余路径一律 404（仅 `/` 与 `/iptest` 会 302 到 `/iptest/`）。
+**鉴权与反代**：`password` 非空即启用 Basic Auth。设置 `path_prefix` 后，页面 `/iptest/`、接口 `/iptest/api/*`、订阅 `/iptest/sub/xxx.txt`，其余路径一律返回 `Are you ok?`（仅 `/iptest` 会 302 到 `/iptest/`）。
 
 ```nginx
 location /iptest/ {
