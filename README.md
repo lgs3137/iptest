@@ -165,12 +165,12 @@ go build -trimpath -ldflags "-s -w" -o iptest .
 **鉴权与反代**：`password` 非空即启用 Basic Auth。设置 `path_prefix` 后，页面 `/iptest/`、接口 `/iptest/api/*`、订阅 `/iptest/sub/xxx.txt`，其余路径一律返回 `Are you ok?`（仅 `/iptest` 会 302 到 `/iptest/`）。
 
 ```nginx
-location /iptest/ {
-    proxy_pass http://127.0.0.1:3000/iptest/;   # 前缀两端都保留，不要 rewrite
+location ~ ^/iptest/ {
+    proxy_pass http://127.0.0.1:3000;
     proxy_http_version 1.1;
     proxy_set_header Host $host;
     proxy_set_header Connection "";
-    proxy_buffering off;        # SSE 实时日志必须关闭缓冲
+    proxy_buffering off;               # SSE 实时日志必须关闭缓冲
     proxy_read_timeout 3600s;
 }
 ```
