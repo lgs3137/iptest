@@ -11,19 +11,20 @@ import (
 )
 
 type SubTemplateItem struct {
-	FileName         string   `json:"file_name"`
-	Template         string   `json:"template"`
-	Subtype          string   `json:"subtype"`
-	PreferredDomains []string `json:"preferred_domains"`
+	IPFileName     string `json:"ip_file_name"`
+	DomainFileName string `json:"domain_file_name"`
+	Template       string `json:"template"`
 }
 
 type SubConfig struct {
-	Enabled     bool              `json:"enabled"`
-	OutputDir   string            `json:"output_dir"`
-	Count       int               `json:"count"`
-	NodeNameTpl string            `json:"node_name_tpl"`
-	B64Encode   bool              `json:"b64encode"`
-	Templates   []SubTemplateItem `json:"templates"`
+	Enabled          bool              `json:"enabled"`
+	OutputDir        string            `json:"output_dir"`
+	Count            int               `json:"count"`
+	NodeNameTpl      string            `json:"node_name_tpl"`
+	B64Encode        bool              `json:"b64encode"`
+	Subtype          []string          `json:"subtype"`
+	PreferredDomains []string          `json:"preferred_domains"`
+	Templates        []SubTemplateItem `json:"templates"`
 }
 
 type SubCreateConfig struct {
@@ -38,17 +39,15 @@ type SpeedResult struct {
 	CountryCode string
 }
 
-// 模板变量正则, 允许字母与下划线
 var tplVarRe = regexp.MustCompile(`\{([A-Za-z_]+)\}`)
 
-// 大小写不敏感的模板替换
 func replaceTpl(tpl string, vars map[string]string) string {
 	return tplVarRe.ReplaceAllStringFunc(tpl, func(m string) string {
 		key := strings.ToLower(m[1 : len(m)-1])
 		if v, ok := vars[key]; ok {
 			return v
 		}
-		return m // 不认识的占位符保留原样, 交由后续步骤处理
+		return m
 	})
 }
 
@@ -105,6 +104,15 @@ func LoadSpeedResults(cfg SubCreateConfig) ([]SpeedResult, error) {
 	return loadSpeedResultsFromFile(cfg.OutFile)
 }
 
+func writeSubFile(outputDir, fileName string, nodes []string, b64 bool) error {
+	content := strings.Join(nodes, "\n")
+	if b64 {
+		content = base64.StdEncoding.EncodeToString([]byte(content))
+	}
+	filePath := filepath.Join(outputDir, fileName)
+	return os.WriteFile(filePath, []byte(content), 0644)
+}
+
 func GenerateAllSubscriptions(cfg SubCreateConfig) error {
 	if !cfg.Sub.Enabled {
 		return fmt.Errorf("订阅生成功能未开启")
@@ -117,7 +125,7 @@ func GenerateAllSubscriptions(cfg SubCreateConfig) error {
 
 	outputDir := cfg.Sub.OutputDir
 	if outputDir == "" {
-		outputDir = "./html"
+		outputDir = "html/"
 	}
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		return fmt.Errorf("创建订阅目录失败: %v", err)
@@ -128,72 +136,80 @@ func GenerateAllSubscriptions(cfg SubCreateConfig) error {
 		nameTpl = "{index}{country}{ip}"
 	}
 
-	for _, item := range cfg.Sub.Templates {
-		var nodes []string
-		var targetCount int
-
-		if item.Subtype == "domain" {
-			if len(item.PreferredDomains) == 0 {
-				fmt.Printf("警告: 模板 [%s] 的类型为 domain, 但未配置 preferred_domains\n", item.FileName)
-				continue
-			}
-			targetCount = len(item.PreferredDomains)
+	subtypes := cfg.Sub.Subtype
+	if len(subtypes) == 0 {
+		if len(cfg.Sub.PreferredDomains) > 0 {
+			subtypes = []string{"ip", "domain"}
 		} else {
-			targetCount = len(results)
+			subtypes = []string{"ip"}
+		}
+	}
+	hasIP := false
+	hasDomain := false
+	for _, st := range subtypes {
+		st = strings.ToLower(strings.TrimSpace(st))
+		if st == "ip" {
+			hasIP = true
+		}
+		if st == "domain" {
+			hasDomain = true
+		}
+	}
+
+	for _, item := range cfg.Sub.Templates {
+		tplLower := strings.ToLower(item.Template)
+		tplHasIP := strings.Contains(tplLower, "{ip}")
+		tplHasDomain := strings.Contains(tplLower, "{domain}")
+
+		if hasIP && tplHasIP && item.IPFileName != "" {
+			var nodes []string
+			targetCount := len(results)
 			if cfg.Sub.Count > 0 && cfg.Sub.Count < targetCount {
 				targetCount = cfg.Sub.Count
 			}
-		}
-
-		for i := 0; i < targetCount; i++ {
-			index := i + 1
-			res := results[i%len(results)]
-
-			targetIP := res.IP
-			targetPort := res.Port
-			targetDomain := ""
-			country := res.Country
-			countryCode := res.CountryCode
-
-			nodeName := ""
-			if item.Subtype == "domain" {
-				targetDomain = item.PreferredDomains[i]
-				nodeName = targetDomain
-			} else {
-				nodeName = replaceTpl(nameTpl, map[string]string{
-					"ip":          targetIP,
-					"port":        targetPort,
+			for i := 0; i < targetCount; i++ {
+				index := i + 1
+				res := results[i%len(results)]
+				nodeName := replaceTpl(nameTpl, map[string]string{
+					"ip":          res.IP,
+					"port":        res.Port,
 					"index":       fmt.Sprintf("%d", index),
-					"country":     country,
-					"countrycode": countryCode,
+					"country":     res.Country,
+					"countrycode": res.CountryCode,
 				})
+				node := replaceTpl(item.Template, map[string]string{
+					"ip":            res.IP,
+					"domain":        "",
+					"port":          res.Port,
+					"node_name_tpl": nodeName,
+				})
+				nodes = append(nodes, node)
 			}
-
-			node := replaceTpl(item.Template, map[string]string{
-				"ip":     targetIP,
-				"domain": targetDomain,
-				"port":   targetPort,
-			})
-			node = replaceTpl(node, map[string]string{"node_name_tpl": nodeName})
-
-			nodes = append(nodes, node)
+			if err := writeSubFile(outputDir, item.IPFileName, nodes, cfg.Sub.B64Encode); err != nil {
+				fmt.Printf("写入订阅文件失败 [%s]: %v\n", item.IPFileName, err)
+			} else {
+				fmt.Printf("订阅文件生成成功: %s (共生成 %d 个节点)\n", filepath.Join(outputDir, item.IPFileName), len(nodes))
+			}
 		}
 
-		content := strings.Join(nodes, "\n")
-		if cfg.Sub.B64Encode {
-			content = base64.StdEncoding.EncodeToString([]byte(content))
+		if hasDomain && tplHasDomain && item.DomainFileName != "" && len(cfg.Sub.PreferredDomains) > 0 {
+			var nodes []string
+			for i, domain := range cfg.Sub.PreferredDomains {
+				res := results[i%len(results)]
+				node := replaceTpl(item.Template, map[string]string{
+					"ip":            "",
+					"domain":        domain,
+					"port":          res.Port,
+					"node_name_tpl": domain,
+				})
+				nodes = append(nodes, node)
+			}
+			if err := writeSubFile(outputDir, item.DomainFileName, nodes, cfg.Sub.B64Encode); err != nil {
+				fmt.Printf("写入订阅文件失败 [%s]: %v\n", item.DomainFileName, err)
+			} else {
+				fmt.Printf("订阅文件生成成功: %s (共生成 %d 个节点)\n", filepath.Join(outputDir, item.DomainFileName), len(nodes))
+			}
 		}
-
-		fileName := item.FileName
-		if fileName == "" {
-			fileName = "subscription.txt"
-		}
-		filePath := filepath.Join(outputDir, fileName)
-		if err := os.WriteFile(filePath, []byte(content), 0644); err != nil {
-			fmt.Printf("写入订阅文件失败 [%s]: %v\n", fileName, err)
-			continue
-		}
-		fmt.Printf("订阅文件生成成功: %s (共生成 %d 个节点)\n", filePath, len(nodes))
 	}
 	return nil
 }

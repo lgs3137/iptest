@@ -34,24 +34,18 @@ const (
 )
 
 var (
-	outFile      = flag.String("outfile", "html/result.csv", "输出结果文件, 支持路径")
-	maxThreads   = flag.Int("max", 100, "并发请求最大协程数")
-	speedTest    = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
-	speedTestURL = flag.String("url", "speed.cloudflare.com/__down?bytes=20000000", "测速文件地址")
-	delay        = flag.Int("delay", 0, "延迟阈值(ms), 默认为0禁用延迟过滤")
-
-	flagSources = flag.String("sources", "", "输入源列表（逗号分隔）, 本地文件路径或 URL, 自动识别；显式指定时覆盖配置文件 sources")
-	flagFile    = flag.String("file", "", "输入文件（单个, 兼容旧版；追加到 sources）")
-	flagUrls    = flag.String("urls", "", "输入源列表（逗号分隔, 兼容旧版；追加到 sources）")
-
-	flagSub = flag.Bool("sub", false, "只读取测速结果文件生成订阅")
-	flagDns = flag.Bool("dns", false, "只读取测速结果文件推送 DNS")
-
-	proxyFlag = flag.String("proxy", "", "代理地址, 例如 socks5://127.0.0.1:10808, 为空则直连; 仅用于远程下载与 DNS 推送")
-
-	minSpeed      = flag.Float64("minspeed", 0, "下载速度合格指标(MB/s), 0为不限制, 例如2表示2MB/s, 支持小数如1.5")
-	minSpeedCount = flag.Int("minspeedcount", 0, "达到合格速度的IP数量限制, 达到后提前停止测速, 0为不限制")
-
+	flagFile          = flag.String("file", "", "输入源列表（逗号分隔），本地文件路径或 URL，覆盖配置中的 file 数组")
+	outFile           = flag.String("outfile", "html/result.csv", "输出结果文件, 支持路径")
+	maxThreads        = flag.Int("max", 100, "并发请求最大协程数")
+	speedTest         = flag.Int("speedtest", 5, "下载测速协程数量,设为0禁用测速")
+	speedTestURL      = flag.String("url", "speed.cloudflare.com/__down?bytes=20000000", "测速文件地址")
+	delay             = flag.Int("delay", 0, "延迟阈值(ms), 默认为0禁用延迟过滤")
+	flagSub           = flag.Bool("sub", false, "只读取测速结果文件生成订阅")
+	flagDns           = flag.Bool("dns", false, "只读取测速结果文件推送 DNS")
+	proxyFlag         = flag.String("proxy", "", "代理地址, 例如 socks5://127.0.0.1:10808, 为空则直连; 仅用于远程下载与 DNS 推送")
+	minSpeed          = flag.Float64("minspeed", 0, "下载速度合格指标(MB/s), 0为不限制, 例如2表示2MB/s, 支持小数如1.5")
+	minSpeedCount     = flag.Int("minspeedcount", 0, "达到合格速度的IP数量限制, 达到后提前停止测速, 0为不限制")
+	rounds            = flag.Int("rounds", 3, "延迟测试轮数，默认3，仅在 speedtest=0 时生效")
 	flagHistoryEnable = flag.Bool("historyenable", false, "启用历史最优归档")
 	flagHistory       = flag.String("history", "", "历史最优归档文件, 例如 bestip.csv")
 	flagHistoryCount  = flag.Int("historycount", 3, "每次归档的排名数量, 默认 3")
@@ -113,10 +107,8 @@ func newOutboundHTTPClient(t time.Duration) *http.Client {
 }
 
 type AppConfig struct {
-	Sources       []string  `json:"sources"`
+	File          []string  `json:"file"`
 	OutFile       string    `json:"outfile"`
-	File          string    `json:"file,omitempty"`
-	URLs          string    `json:"urls,omitempty"`
 	Proxy         string    `json:"proxy"`
 	Max           int       `json:"max"`
 	SpeedTest     int       `json:"speedtest"`
@@ -124,6 +116,7 @@ type AppConfig struct {
 	Delay         int       `json:"delay"`
 	MinSpeed      float64   `json:"min_speed"`
 	MinSpeedCount int       `json:"min_speed_count"`
+	Rounds        int       `json:"rounds"`
 	HistoryEnable bool      `json:"history_enable"`
 	History       string    `json:"history"`
 	HistoryCount  int       `json:"history_count"`
@@ -141,11 +134,10 @@ func defaultConfigPath() string {
 }
 
 func generateDefaultConfig(path string) error {
-	ipTpl := "vless://AreYouOK@{ip}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=/AreYouOK&mode=auto#{node_name_tpl}"
-	domainTpl := "vless://AreYouOK@{domain}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=/AreYouOK&mode=auto#{domain}"
+	combinedTpl := "vless://AreYouOK@{ip}{domain}:{port}?encryption=none&security=tls&sni=your.domain.com&fp=chrome&type=xhttp&host=your.domain.com&path=/AreYouOK&mode=auto#{node_name_tpl}"
 
 	cfg := AppConfig{
-		Sources:       []string{"html/bestip.csv"},
+		File:          []string{"html/bestip.csv"},
 		OutFile:       "html/result.csv",
 		Proxy:         "",
 		Max:           100,
@@ -154,28 +146,24 @@ func generateDefaultConfig(path string) error {
 		Delay:         0,
 		MinSpeed:      0,
 		MinSpeedCount: 0,
-		HistoryEnable: false,
+		Rounds:        3,
+		HistoryEnable: true,
 		History:       "html/bestip.csv",
 		HistoryCount:  3,
 		HistoryLimit:  1000,
 		SubConfig: SubConfig{
-			Enabled:     false,
-			OutputDir:   "./html",
-			Count:       15,
-			NodeNameTpl: "{index}{Country}{CountryCode}{ip}",
-			B64Encode:   true,
+			Enabled:          false,
+			OutputDir:        "html/",
+			Count:            15,
+			NodeNameTpl:      "{index}{Country}{CountryCode}{ip}",
+			B64Encode:        true,
+			Subtype:          []string{"ip", "domain"},
+			PreferredDomains: []string{"1.example.com", "2.example.com", "3.example.com"},
 			Templates: []SubTemplateItem{
 				{
-					FileName:         "subip.txt",
-					Template:         ipTpl,
-					Subtype:          "ip",
-					PreferredDomains: []string{},
-				},
-				{
-					FileName:         "subdomain.txt",
-					Template:         domainTpl,
-					Subtype:          "domain",
-					PreferredDomains: []string{"1.example.com", "2.example.com", "3.example.com"},
+					IPFileName:     "subip.txt",
+					DomainFileName: "subdomain.txt",
+					Template:       combinedTpl,
 				},
 			},
 		},
@@ -239,6 +227,9 @@ func applyConfig(cfg *AppConfig, visited map[string]bool) {
 	}
 	if !visited["minspeedcount"] {
 		*minSpeedCount = cfg.MinSpeedCount
+	}
+	if !visited["rounds"] && cfg.Rounds > 0 {
+		*rounds = cfg.Rounds
 	}
 	if !visited["proxy"] && cfg.Proxy != "" {
 		*proxyFlag = cfg.Proxy
@@ -374,26 +365,12 @@ func increaseMaxOpenFiles() {
 	}
 }
 
-func collectSources(cfg *AppConfig, visited map[string]bool) []string {
+func collectFiles(cfg *AppConfig, visited map[string]bool) []string {
 	var raw []string
-
-	if visited["sources"] {
-		raw = append(raw, splitURLs(*flagSources)...)
-	} else {
-		raw = append(raw, cfg.Sources...)
-		if cfg.File != "" {
-			raw = append(raw, cfg.File)
-		}
-		if cfg.URLs != "" {
-			raw = append(raw, splitURLs(cfg.URLs)...)
-		}
-	}
-
 	if visited["file"] {
-		raw = append(raw, *flagFile)
-	}
-	if visited["urls"] {
-		raw = append(raw, splitURLs(*flagUrls)...)
+		raw = splitURLs(*flagFile)
+	} else {
+		raw = cfg.File
 	}
 
 	seen := make(map[string]bool)
@@ -446,9 +423,9 @@ func main() {
 
 	initProxy(*proxyFlag)
 
-	sources := collectSources(cfg, visited)
-	fmt.Printf("[source] 待处理输入源: %d 个\n", len(sources))
-	for i, s := range sources {
+	files := collectFiles(cfg, visited)
+	fmt.Printf("[source] 待处理输入源: %d 个\n", len(files))
+	for i, s := range files {
 		kind := "远程"
 		if isLocalSource(s) {
 			kind = "本地"
@@ -456,7 +433,7 @@ func main() {
 		fmt.Printf("[source]   %d. [%s] %s\n", i+1, kind, s)
 	}
 
-	ips, err := fetchIPsFromSources(sources, 2)
+	ips, err := fetchIPsFromSources(files, 2)
 	if err != nil {
 		fmt.Printf("加载输入源失败: %v\n", err)
 		return
@@ -495,7 +472,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 	var wg sync.WaitGroup
 	wg.Add(len(ips))
 
-	resultChan := make(chan result, len(ips))
+	connResultChan := make(chan result, len(ips))
 	thread := make(chan struct{}, *maxThreads)
 
 	var count int
@@ -559,23 +536,85 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 				tcpDuration: tcpDuration,
 			}
 
-			resultChan <- res
+			connResultChan <- res
 		}(ip)
 	}
 
 	wg.Wait()
-	close(resultChan)
+	close(connResultChan)
 
-	if len(resultChan) == 0 {
+	var connResults []result
+	for res := range connResultChan {
+		connResults = append(connResults, res)
+	}
+
+	if len(connResults) == 0 {
 		fmt.Println("没有发现有效的IP")
 		return
 	}
+
+	if *speedTest == 0 {
+		if *rounds < 1 {
+			*rounds = 1
+		}
+		totalN := len(connResults)
+		safePrintf("\n开始延迟测试, 共 %d 个 IP, 每个 IP 测试 %d 轮\n", totalN, *rounds)
+
+		var wg3 sync.WaitGroup
+		wg3.Add(totalN)
+		var delayDone int32
+
+		for i := range connResults {
+			thread <- struct{}{}
+			go func(idx int) {
+				defer func() {
+					<-thread
+					wg3.Done()
+					c := atomic.AddInt32(&delayDone, 1)
+					percentage := float64(c) / float64(totalN) * 100
+					if int(c) >= totalN {
+						safePrintf("[延迟测试] 已完成: %.2f%%\n", percentage)
+					} else if int(c)%10 == 0 {
+						safePrintf("[延迟测试] 已完成: %d / %d (%.2f%%)\n", c, totalN, percentage)
+					}
+				}()
+				totalDur := time.Duration(0)
+				cnt := 0
+				for r := 0; r < *rounds; r++ {
+					dialer := &net.Dialer{Timeout: timeout, KeepAlive: 0}
+					start := time.Now()
+					conn, err := dialer.Dial("tcp", net.JoinHostPort(connResults[idx].ip, strconv.Itoa(connResults[idx].port)))
+					if err == nil {
+						conn.Close()
+						totalDur += time.Since(start)
+						cnt++
+					}
+				}
+				if cnt > 0 {
+					avg := totalDur / time.Duration(cnt)
+					connResults[idx].tcpDuration = avg
+					connResults[idx].latency = fmt.Sprintf("%d", avg.Milliseconds())
+				}
+			}(i)
+		}
+		wg3.Wait()
+	}
+
+	sort.Slice(connResults, func(i, j int) bool {
+		return connResults[i].tcpDuration < connResults[j].tcpDuration
+	})
 
 	var results []speedtestresult
 	if *speedTest > 0 {
 		safePrintf("\n找到符合条件的IP共 %d 个\n\n开始测速...\n", atomic.LoadInt32(&validCount))
 
-		total := len(resultChan)
+		speedChan := make(chan result, len(connResults))
+		for _, res := range connResults {
+			speedChan <- res
+		}
+		close(speedChan)
+
+		total := len(connResults)
 		var wg2 sync.WaitGroup
 		wg2.Add(*speedTest)
 
@@ -595,7 +634,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 					<-thread
 					wg2.Done()
 				}()
-				for res := range resultChan {
+				for res := range speedChan {
 					if enableEarlyStop && atomic.LoadInt32(&stop) == 1 {
 						continue
 					}
@@ -630,7 +669,7 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 		}
 	} else {
 		safePrintf("\n找到符合条件的IP共 %d 个 (已禁用下载测速)\n", atomic.LoadInt32(&validCount))
-		for res := range resultChan {
+		for _, res := range connResults {
 			results = append(results, speedtestresult{result: res})
 		}
 	}
@@ -638,10 +677,6 @@ func runSpeedtest(cfg *AppConfig, ips []string) {
 	if *speedTest > 0 {
 		sort.Slice(results, func(i, j int) bool {
 			return results[i].downloadSpeed > results[j].downloadSpeed
-		})
-	} else {
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].result.tcpDuration < results[j].result.tcpDuration
 		})
 	}
 
