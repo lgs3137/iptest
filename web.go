@@ -20,6 +20,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"bytes"
+	"os/exec"
 )
 
 type Event struct {
@@ -668,26 +670,31 @@ func writeDecoy(w http.ResponseWriter) {
 }
 
 var routeTable = map[string]http.HandlerFunc{
-	"/api/state":           handleState,
-	"/api/config":          handleConfig,
-	"/api/config/reset":    handleConfigReset,
-	"/api/run":             handleRun,
-	"/api/stop":            handleStop,
-	"/api/logs":            handleLogs,
-	"/api/events":          handleEvents,
-	"/api/results":         handleResults,
-	"/api/history":         handleHistory,
-	"/api/history/trim":    handleHistoryTrim,
-	"/api/history/clear":   handleHistoryClear,
-	"/api/files":           handleFiles,
-	"/api/file":            handleFile,
-	"/api/sources/preview": handleSourcesPreview,
-	"/api/proxy/test":      handleProxyTest,
-	"/api/ip/test":         handleIPTest,
-	"/api/sub/preview":     handleSubPreview,
-	"/api/sub/generate":    handleSubGenerate,
-	"/api/dns/plan":        handleDNSPlan,
-	"/api/dns/records":     handleDNSRecords,
+	"/api/state":             handleState,
+	"/api/config":            handleConfig,
+	"/api/config/reset":      handleConfigReset,
+	"/api/run":               handleRun,
+	"/api/stop":              handleStop,
+	"/api/logs":              handleLogs,
+	"/api/events":            handleEvents,
+	"/api/results":           handleResults,
+	"/api/history":           handleHistory,
+	"/api/history/trim":      handleHistoryTrim,
+	"/api/history/clear":     handleHistoryClear,
+	"/api/files":             handleFiles,
+	"/api/file":              handleFile,
+	"/api/sources/preview":   handleSourcesPreview,
+	"/api/proxy/test":        handleProxyTest,
+	"/api/ip/test":           handleIPTest,
+	"/api/sub/preview":       handleSubPreview,
+	"/api/sub/generate":      handleSubGenerate,
+	"/api/dns/plan":          handleDNSPlan,
+	"/api/dns/records":       handleDNSRecords,
+	"/api/dns/record":        handleDNSRecordPush,
+	"/api/schedule":          handleSchedule,
+	"/api/schedule/run":      handleScheduleRun,
+	"/api/schedule/preview":  handleSchedulePreview,
+	"/api/schedule/snapshot": handleScheduleSnapshot,
 }
 
 func buildRouter() http.Handler {
@@ -752,11 +759,13 @@ func runWebServer(cfg *AppConfig) error {
 		<-sig
 		logWarnf("[web] 收到中断信号, 正在关闭服务...")
 		stopJob()
+		stopScheduler()
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(ctx)
 	}()
 	go initProxy(cfg.Proxy)
+	startScheduler()
 
 	dhost := cfg.WebConfig.Host
 	if dhost == "0.0.0.0" || dhost == "::" || dhost == "" {
@@ -877,6 +886,9 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, err.Error())
 			return
 		}
+		if cfg.Schedule == nil {
+			cfg.Schedule = currentConfig().Schedule
+		}
 		normalizeConfig(&cfg)
 		old := currentConfig()
 		if err := saveConfigToFile(&cfg, configPath()); err != nil {
@@ -884,6 +896,7 @@ func handleConfig(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		setGlobalConfig(&cfg)
+		reloadSchedule()
 		hub.setMax(cfg.WebConfig.LogBuffer)
 		logOkf("[cfg] 配置已保存到 %s", configPath())
 		if old.Proxy != cfg.Proxy {
@@ -980,6 +993,60 @@ func handleRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "job_id": id, "mode": mode})
+}
+
+func handleDNSRecordPush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, 405, "方法不允许")
+		return
+	}
+	var req struct {
+		Type     string `json:"type"`
+		Name     string `json:"name"`
+		Content  string `json:"content"`
+		TTL      int    `json:"ttl"`
+		Proxied  bool   `json:"proxied"`
+		Priority *int   `json:"priority"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errJSON(w, 400, err.Error())
+		return
+	}
+	rec := CloudflareDNSRecord{
+		Type:     strings.ToUpper(strings.TrimSpace(req.Type)),
+		Name:     strings.TrimSpace(req.Name),
+		Content:  strings.TrimSpace(req.Content),
+		TTL:      req.TTL,
+		Proxied:  req.Proxied,
+		Priority: req.Priority,
+	}
+	if rec.Type == "" || rec.Name == "" || rec.Content == "" {
+		errJSON(w, 400, "type / name / content 均不能为空")
+		return
+	}
+	switch rec.Type {
+	case "A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "PTR", "TLSA", "SSHFP", "DS", "DNSKEY", "URI", "LOC", "CERT":
+	default:
+		errJSON(w, 400, "不支持的记录类型: "+rec.Type)
+		return
+	}
+	if rec.TTL <= 0 {
+		rec.TTL = 300
+	}
+	if rec.Proxied && rec.Type != "A" && rec.Type != "AAAA" && rec.Type != "CNAME" {
+		logWarnf("[dns] %s 记录不支持 proxied, 已自动置为 false", rec.Type)
+		rec.Proxied = false
+	}
+	cfg := currentConfig()
+	ctx, cancel := context.WithTimeout(r.Context(), 40*time.Second)
+	defer cancel()
+	if err := upsertCFRecord(ctx, cfg.DNSConfig, rec); err != nil {
+		logErrf("[dns] 手动推送失败 [%s (%s) -> %s]: %v", rec.Name, rec.Type, rec.Content, err)
+		errJSON(w, 400, err.Error())
+		return
+	}
+	logOkf("[dns] 手动推送/更新成功: %s (%s) -> %s (ttl=%d, proxied=%v)", rec.Name, rec.Type, rec.Content, rec.TTL, rec.Proxied)
+	writeJSON(w, 200, map[string]any{"ok": true, "record": rec})
 }
 
 func handleStop(w http.ResponseWriter, r *http.Request) {
@@ -1472,6 +1539,943 @@ func handleDNSRecords(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+type ScheduleConfig struct {
+	Enabled bool            `json:"enabled"`
+	Tasks   []ScheduledTask `json:"tasks"`
+}
+
+type ScheduledTask struct {
+	ID      string    `json:"id"`
+	Name    string    `json:"name"`
+	Enabled bool      `json:"enabled"`
+	Cron    string    `json:"cron"`
+	Mode    string    `json:"mode"`
+	Shell   string    `json:"shell"`
+	Script  string    `json:"script"`
+	Timeout int       `json:"timeout_sec"`
+	Guard   TaskGuard `json:"guard"`
+}
+
+type TaskGuard struct {
+	TopSpeedEnabled bool    `json:"top_speed_enabled"`
+	TopSpeedMBps    float64 `json:"top_speed_mbps"`
+	TopIP           string  `json:"top_ip"`
+	TopPort         int     `json:"top_port"`
+	SourceChanged   bool    `json:"source_changed_enabled"`
+}
+
+func normalizeSchedule(sc *ScheduleConfig) {
+	if sc == nil {
+		return
+	}
+	seen := map[string]bool{}
+	for i := range sc.Tasks {
+		t := &sc.Tasks[i]
+		t.Name = strings.TrimSpace(t.Name)
+		if t.Name == "" {
+			t.Name = fmt.Sprintf("任务%d", i+1)
+		}
+		t.ID = strings.TrimSpace(t.ID)
+		if t.ID == "" {
+			t.ID = fmt.Sprintf("task-%d", i+1)
+		}
+		for seen[t.ID] {
+			t.ID += "x"
+		}
+		seen[t.ID] = true
+		t.Cron = strings.TrimSpace(t.Cron)
+		if t.Cron == "" {
+			t.Cron = "0 4 * * *"
+		}
+		t.Mode = strings.ToLower(strings.TrimSpace(t.Mode))
+		switch t.Mode {
+		case "full", "speedtest", "sub", "dns", "script":
+		default:
+			t.Mode = "full"
+		}
+		if t.Timeout < 0 {
+			t.Timeout = 0
+		}
+		if t.Guard.TopSpeedMBps < 0 {
+			t.Guard.TopSpeedMBps = 0
+		}
+		if t.Guard.TopPort < 0 || t.Guard.TopPort > 65535 {
+			t.Guard.TopPort = 0
+		}
+		t.Shell = strings.TrimSpace(t.Shell)
+	}
+}
+
+type cronSpec struct {
+	every                    time.Duration
+	min, hour, dom, mon, dow uint64
+	domStar, dowStar         bool
+}
+
+var cronMonthNames = map[string]int{"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6, "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12}
+var cronDowNames = map[string]int{"sun": 0, "mon": 1, "tue": 2, "wed": 3, "thu": 4, "fri": 5, "sat": 6}
+
+func cronNum(s string, names map[string]int) (int, error) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	if names != nil {
+		if v, ok := names[s]; ok {
+			return v, nil
+		}
+	}
+	return strconv.Atoi(s)
+}
+
+func parseCronField(field string, lo, hi int, names map[string]int) (uint64, bool, error) {
+	var mask uint64
+	star := strings.HasPrefix(field, "*")
+	for _, part := range strings.Split(field, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return 0, false, errors.New("存在空字段")
+		}
+		step := 1
+		if i := strings.Index(part, "/"); i >= 0 {
+			v, err := strconv.Atoi(part[i+1:])
+			if err != nil || v <= 0 {
+				return 0, false, fmt.Errorf("步长无效: %s", part)
+			}
+			step, part = v, part[:i]
+		}
+		var a, b int
+		var err error
+		switch {
+		case part == "*":
+			a, b = lo, hi
+		case strings.Contains(part, "-"):
+			r := strings.SplitN(part, "-", 2)
+			if a, err = cronNum(r[0], names); err != nil {
+				return 0, false, fmt.Errorf("无效取值: %s", part)
+			}
+			if b, err = cronNum(r[1], names); err != nil {
+				return 0, false, fmt.Errorf("无效取值: %s", part)
+			}
+		default:
+			if a, err = cronNum(part, names); err != nil {
+				return 0, false, fmt.Errorf("无效取值: %s", part)
+			}
+			b = a
+			if step > 1 {
+				b = hi
+			}
+		}
+		if a < lo || b > hi || a > b {
+			return 0, false, fmt.Errorf("取值超出范围 [%d,%d]: %s", lo, hi, part)
+		}
+		for v := a; v <= b; v += step {
+			mask |= 1 << uint(v)
+		}
+	}
+	return mask, star, nil
+}
+
+func parseCron(expr string) (*cronSpec, error) {
+	s := strings.ToLower(strings.TrimSpace(expr))
+	if s == "" {
+		return nil, errors.New("cron 表达式为空")
+	}
+	switch s {
+	case "@hourly":
+		s = "0 * * * *"
+	case "@daily", "@midnight":
+		s = "0 0 * * *"
+	case "@weekly":
+		s = "0 0 * * 0"
+	case "@monthly":
+		s = "0 0 1 * *"
+	case "@yearly", "@annually":
+		s = "0 0 1 1 *"
+	}
+	if strings.HasPrefix(s, "@every ") {
+		d, err := time.ParseDuration(strings.TrimSpace(s[7:]))
+		if err != nil || d < 10*time.Second {
+			return nil, errors.New("@every 间隔无效(最小 10s), 例: @every 30m")
+		}
+		return &cronSpec{every: d}, nil
+	}
+	f := strings.Fields(s)
+	if len(f) != 5 {
+		return nil, fmt.Errorf("需要 5 个字段(分 时 日 月 周), 当前 %d 个", len(f))
+	}
+	var sp cronSpec
+	var err error
+	if sp.min, _, err = parseCronField(f[0], 0, 59, nil); err != nil {
+		return nil, fmt.Errorf("分钟: %v", err)
+	}
+	if sp.hour, _, err = parseCronField(f[1], 0, 23, nil); err != nil {
+		return nil, fmt.Errorf("小时: %v", err)
+	}
+	if sp.dom, sp.domStar, err = parseCronField(f[2], 1, 31, nil); err != nil {
+		return nil, fmt.Errorf("日: %v", err)
+	}
+	if sp.mon, _, err = parseCronField(f[3], 1, 12, cronMonthNames); err != nil {
+		return nil, fmt.Errorf("月: %v", err)
+	}
+	if sp.dow, sp.dowStar, err = parseCronField(f[4], 0, 7, cronDowNames); err != nil {
+		return nil, fmt.Errorf("周: %v", err)
+	}
+	if sp.dow&(1<<7) != 0 {
+		sp.dow |= 1
+		sp.dow &^= 1 << 7
+	}
+	return &sp, nil
+}
+
+func (s *cronSpec) dayMatch(t time.Time) bool {
+	domOK := s.dom&(1<<uint(t.Day())) != 0
+	dowOK := s.dow&(1<<uint(t.Weekday())) != 0
+	switch {
+	case s.domStar && s.dowStar:
+		return true
+	case s.domStar:
+		return dowOK
+	case s.dowStar:
+		return domOK
+	}
+	return domOK || dowOK
+}
+
+func (s *cronSpec) next(from time.Time) time.Time {
+	if s.every > 0 {
+		return from.Add(s.every)
+	}
+	loc := from.Location()
+	t := time.Date(from.Year(), from.Month(), from.Day(), from.Hour(), from.Minute(), 0, 0, loc).Add(time.Minute)
+	limit := t.AddDate(1, 0, 0)
+	for t.Before(limit) {
+		if s.mon&(1<<uint(t.Month())) == 0 {
+			t = time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, loc).AddDate(0, 1, 0)
+			continue
+		}
+		if !s.dayMatch(t) {
+			t = time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, loc).AddDate(0, 0, 1)
+			continue
+		}
+		if s.hour&(1<<uint(t.Hour())) == 0 {
+			t = time.Date(t.Year(), t.Month(), t.Day(), t.Hour(), 0, 0, 0, loc).Add(time.Hour)
+			continue
+		}
+		if s.min&(1<<uint(t.Minute())) == 0 {
+			t = t.Add(time.Minute)
+			continue
+		}
+		return t
+	}
+	return time.Time{}
+}
+
+func nextRunAfter(t ScheduledTask, from time.Time) time.Time {
+	if !t.Enabled {
+		return time.Time{}
+	}
+	sp, err := parseCron(t.Cron)
+	if err != nil {
+		return time.Time{}
+	}
+	return sp.next(from)
+}
+
+type sourceSnapshot struct {
+	Time string   `json:"time"`
+	IPs  []string `json:"ips"`
+}
+
+var (
+	srcMu   sync.Mutex
+	srcSnap sourceSnapshot
+)
+
+func sourceSnapshotPath() string {
+	return filepath.Join(os.TempDir(), "iptest-source-snapshot.json")
+}
+
+func loadSourceSnapshot() {
+	data, err := os.ReadFile(sourceSnapshotPath())
+	if err != nil {
+		return
+	}
+	var s sourceSnapshot
+	if json.Unmarshal(data, &s) == nil && len(s.IPs) > 0 {
+		srcMu.Lock()
+		srcSnap = s
+		srcMu.Unlock()
+		logf("[sched] 已载入输入源快照: %d 个 IP (%s)", len(s.IPs), s.Time)
+	}
+}
+
+func sourceSnapshotIPs() []string {
+	srcMu.Lock()
+	defer srcMu.Unlock()
+	return append([]string(nil), srcSnap.IPs...)
+}
+
+func noteSourceIPs(ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	srcMu.Lock()
+	same := len(srcSnap.IPs) == len(ips)
+	if same {
+		for i := range ips {
+			if srcSnap.IPs[i] != ips[i] {
+				same = false
+				break
+			}
+		}
+	}
+	srcSnap = sourceSnapshot{Time: time.Now().Format("2006-01-02 15:04:05"), IPs: append([]string(nil), ips...)}
+	s := srcSnap
+	srcMu.Unlock()
+	if same {
+		return
+	}
+	if b, err := json.Marshal(s); err == nil {
+		_ = os.WriteFile(sourceSnapshotPath(), b, 0644)
+	}
+}
+
+type taskState struct {
+	Next    time.Time
+	Last    time.Time
+	Status  string
+	Msg     string
+	Runs    int
+	Skips   int
+	Running bool
+}
+
+var (
+	schedMu       sync.Mutex
+	schedStates   = map[string]*taskState{}
+	schedStop     chan struct{}
+	schedStartOne sync.Once
+	schedStopOne  sync.Once
+)
+
+func jobDoneChan() chan struct{} {
+	jobMu.Lock()
+	defer jobMu.Unlock()
+	return jobDone
+}
+
+func setTaskResult(id, status, msg string) {
+	schedMu.Lock()
+	s := schedStates[id]
+	if s == nil {
+		s = &taskState{}
+		schedStates[id] = s
+	}
+	s.Status, s.Msg, s.Last = status, msg, time.Now()
+	if status == "skipped" {
+		s.Skips++
+	} else {
+		s.Runs++
+	}
+	schedMu.Unlock()
+}
+
+func currentTaskByID(id string) *ScheduledTask {
+	sc := currentConfig().Schedule
+	if sc == nil {
+		return nil
+	}
+	for i := range sc.Tasks {
+		if sc.Tasks[i].ID == id {
+			return &sc.Tasks[i]
+		}
+	}
+	return nil
+}
+
+func reloadSchedule() {
+	sc := currentConfig().Schedule
+	now := time.Now()
+	type line struct{ name, cron, mode, next string; enabled bool }
+	var lines []line
+
+	schedMu.Lock()
+	old := schedStates
+	schedStates = make(map[string]*taskState)
+	if sc != nil {
+		for _, t := range sc.Tasks {
+			s := &taskState{}
+			if o := old[t.ID]; o != nil {
+				s.Last, s.Status, s.Msg = o.Last, o.Status, o.Msg
+				s.Runs, s.Skips, s.Running = o.Runs, o.Skips, o.Running
+				if s.Running {
+					s.Next = o.Next
+				}
+			}
+			if !s.Running {
+				s.Next = nextRunAfter(t, now)
+			}
+			schedStates[t.ID] = s
+			nx := fmtTime(s.Next)
+			if nx == "" {
+				nx = "-"
+			}
+			lines = append(lines, line{t.Name, t.Cron, t.Mode, nx, t.Enabled})
+		}
+	}
+	enabled := sc != nil && sc.Enabled
+	schedMu.Unlock()
+
+	logOkf("[sched] 计划已重新初始化: 共 %d 个任务, 启用调度=%v", len(lines), enabled)
+	for _, l := range lines {
+		if l.enabled {
+			logf("[sched]   · %s | %s | %s | 下次 %s", l.name, l.cron, l.mode, l.next)
+		} else {
+			logf("[sched]   · %s | %s | %s | 已停用", l.name, l.cron, l.mode)
+		}
+	}
+}
+
+func startScheduler() {
+	schedStartOne.Do(func() {
+		loadSourceSnapshot()
+		schedStop = make(chan struct{})
+		reloadSchedule()
+		go func() {
+			tk := time.NewTicker(5 * time.Second)
+			defer tk.Stop()
+			for {
+				select {
+				case <-schedStop:
+					return
+				case <-tk.C:
+					schedTick()
+				}
+			}
+		}()
+		zone, _ := time.Now().Zone()
+		logf("[sched] 计划任务调度器已启动 (随 Web 服务运行, 时区 %s, 精度 ~5s)", zone)
+	})
+}
+
+func stopScheduler() {
+	schedStopOne.Do(func() {
+		if schedStop != nil {
+			close(schedStop)
+		}
+	})
+}
+
+func schedTick() {
+	sc := currentConfig().Schedule
+	if sc == nil || !sc.Enabled {
+		return
+	}
+	now := time.Now()
+	var due []ScheduledTask
+	schedMu.Lock()
+	for _, t := range sc.Tasks {
+		if !t.Enabled {
+			continue
+		}
+		s := schedStates[t.ID]
+		if s == nil {
+			s = &taskState{}
+			schedStates[t.ID] = s
+		}
+		if s.Running {
+			continue
+		}
+		if s.Next.IsZero() {
+			s.Next = nextRunAfter(t, now)
+			continue
+		}
+		if now.Before(s.Next) {
+			continue
+		}
+		s.Next = nextRunAfter(t, now)
+		s.Running, s.Status, s.Last = true, "running", now
+		due = append(due, t)
+	}
+	schedMu.Unlock()
+	for _, t := range due {
+		go execScheduledTask(t, false, false, false)
+	}
+}
+
+func evaluateGuards(t ScheduledTask, st Settings) (bool, string) {
+	g := t.Guard
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	if g.TopSpeedEnabled {
+		ip, port := strings.TrimSpace(g.TopIP), g.TopPort
+		if ip == "" {
+			results, err := loadSpeedResultsFromFile(st.OutFile)
+			if err != nil || len(results) == 0 {
+				logWarnf("[task:%s] 条件①: 无可用历史结果, 视为需要执行", t.Name)
+			} else {
+				ip = results[0].IP
+				if port <= 0 {
+					port, _ = strconv.Atoi(results[0].Port)
+				}
+			}
+		}
+		if ip != "" {
+			if port <= 0 {
+				port = 443
+			}
+			sp := getDownloadSpeed(ctx, st, ip, port)
+			logf("[task:%s] 条件①: 榜首复测 %s:%d → %.2f MB/s (阈值 %.2f)", t.Name, ip, port, sp, g.TopSpeedMBps)
+			if sp > 0 && sp >= g.TopSpeedMBps {
+				return true, fmt.Sprintf("榜首 %s 仍有 %.2f MB/s ≥ %.2f, 无需重测", ip, sp, g.TopSpeedMBps)
+			}
+		}
+	}
+
+	if g.SourceChanged {
+		old := sourceSnapshotIPs()
+		setPhase("guard", "计划预检: 采集输入源", 0)
+		ips, err := fetchIPsFromSources(ctx, st, st.Sources, st.SourceDepth)
+		if err != nil {
+			logWarnf("[task:%s] 条件②: 预采集失败(%v), 视为需要执行", t.Name, err)
+			return false, ""
+		}
+		if len(old) == 0 {
+			logf("[task:%s] 条件②: 无历史快照, 视为需要执行 (本次 %d 个 IP)", t.Name, len(ips))
+		} else {
+			set := make(map[string]struct{}, len(old))
+			for _, v := range old {
+				set[v] = struct{}{}
+			}
+			newCnt := 0
+			for _, v := range ips {
+				if _, ok := set[v]; !ok {
+					newCnt++
+				}
+			}
+			logf("[task:%s] 条件②: 本次 %d / 上次 %d / 新增 %d", t.Name, len(ips), len(old), newCnt)
+			if len(ips) > 0 && newCnt == 0 {
+				return true, fmt.Sprintf("输入源无新增 IP (%d 个全部命中上次记录)", len(ips))
+			}
+		}
+	}
+	return false, ""
+}
+
+type logWriter struct {
+	prefix string
+	level  string
+	buf    []byte
+}
+
+func (w *logWriter) Write(p []byte) (int, error) {
+	w.buf = append(w.buf, p...)
+	for {
+		i := bytes.IndexByte(w.buf, '\n')
+		if i < 0 {
+			break
+		}
+		line := strings.TrimRight(string(w.buf[:i]), "\r")
+		w.buf = w.buf[i+1:]
+		if strings.TrimSpace(line) != "" {
+			hub.add(w.level, w.prefix+line)
+		}
+	}
+	if len(w.buf) > 64*1024 {
+		w.flush()
+	}
+	return len(p), nil
+}
+
+func (w *logWriter) flush() {
+	if len(w.buf) > 0 {
+		hub.add(w.level, w.prefix+string(w.buf))
+		w.buf = nil
+	}
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func runScriptTask(t ScheduledTask, cfg *AppConfig, st Settings) {
+	script := strings.ReplaceAll(strings.TrimSpace(t.Script), "\r\n", "\n")
+	if script == "" {
+		logErrf("[task:%s] 脚本内容为空", t.Name)
+		setTaskResult(t.ID, "error", "脚本内容为空")
+		return
+	}
+	cwd, _ := os.Getwd()
+	shell := strings.TrimSpace(t.Shell)
+	if shell == "" {
+		if runtime.GOOS == "windows" {
+			shell = "cmd"
+		} else {
+			shell = "sh"
+		}
+	}
+	base := strings.ToLower(filepath.Base(shell))
+	kind := "posix"
+	switch {
+	case base == "cmd" || base == "cmd.exe":
+		kind = "cmd"
+	case strings.Contains(base, "powershell") || base == "pwsh" || base == "pwsh.exe":
+		kind = "ps"
+	}
+	ext := ".sh"
+	if kind == "cmd" {
+		ext = ".bat"
+	} else if kind == "ps" {
+		ext = ".ps1"
+	}
+
+	f, err := os.CreateTemp("", "iptest-task-*"+ext)
+	if err != nil {
+		logErrf("[task:%s] 创建临时脚本失败: %v", t.Name, err)
+		setTaskResult(t.ID, "error", err.Error())
+		return
+	}
+	path := f.Name()
+	defer os.Remove(path)
+
+	body := script + "\n"
+	switch kind {
+	case "cmd":
+		var b strings.Builder
+		b.WriteString("@echo off\r\n")
+		if !isASCII(script) {
+			b.WriteString("chcp 65001 >nul 2>&1\r\n")
+		}
+		b.WriteString("cd /d \"" + cwd + "\"\r\n")
+		b.WriteString(strings.ReplaceAll(script, "\n", "\r\n"))
+		b.WriteString("\r\n")
+		body = b.String()
+	case "ps":
+		body = "\ufeff" + script + "\n"
+	}
+	if _, err := f.WriteString(body); err != nil {
+		f.Close()
+		logErrf("[task:%s] 写入临时脚本失败: %v", t.Name, err)
+		setTaskResult(t.ID, "error", err.Error())
+		return
+	}
+	f.Close()
+
+	timeout := time.Duration(t.Timeout) * time.Second
+	if timeout <= 0 {
+		timeout = 300 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	exe, _ := os.Executable()
+	var cmd *exec.Cmd
+	switch kind {
+	case "cmd":
+		cmd = exec.CommandContext(ctx, shell, "/D", "/C", filepath.Base(path))
+		cmd.Dir = filepath.Dir(path)
+	case "ps":
+		cmd = exec.CommandContext(ctx, shell, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path)
+		cmd.Dir = cwd
+	default:
+		cmd = exec.CommandContext(ctx, shell, path)
+		cmd.Dir = cwd
+	}
+	cmd.Env = append(os.Environ(),
+		"IPTEST_CONFIG="+configPath(),
+		"IPTEST_OUTFILE="+st.OutFile,
+		"IPTEST_SUBDIR="+cfg.SubConfig.OutputDir,
+		"IPTEST_BIN="+exe,
+		"IPTEST_TASK="+t.Name,
+	)
+	prefix := "[task:" + t.Name + "] "
+	wo := &logWriter{prefix: prefix, level: "info"}
+	we := &logWriter{prefix: prefix, level: "warn"}
+	cmd.Stdout, cmd.Stderr = wo, we
+
+	logf("[task:%s] 开始执行脚本 (shell=%s, 超时 %ds, 工作目录 %s)", t.Name, shell, int(timeout.Seconds()), cwd)
+	logDebugf("[task:%s] 脚本内容:\n%s", t.Name, script)
+	start := time.Now()
+	runErr := cmd.Run()
+	wo.flush()
+	we.flush()
+	el := time.Since(start).Seconds()
+
+	code := 0
+	if ee, ok := runErr.(*exec.ExitError); ok {
+		code = ee.ExitCode()
+	}
+	switch {
+	case ctx.Err() == context.DeadlineExceeded:
+		logErrf("[task:%s] 脚本超时被终止 (%.1fs)", t.Name, el)
+		setTaskResult(t.ID, "error", fmt.Sprintf("脚本超时 %ds", int(timeout.Seconds())))
+	case runErr != nil:
+		logErrf("[task:%s] 脚本失败 (退出码 %d, %.1fs): %v", t.Name, code, el, runErr)
+		setTaskResult(t.ID, "error", fmt.Sprintf("退出码 %d: %v", code, runErr))
+	default:
+		logOkf("[task:%s] 脚本完成 (退出码 0, 耗时 %.1fs)", t.Name, el)
+		setTaskResult(t.ID, "ok", fmt.Sprintf("退出码 0, 耗时 %.1fs", el))
+	}
+}
+
+func execScheduledTask(t ScheduledTask, manual, guardOnly, ignoreGuard bool) {
+	defer func() {
+		cur := currentTaskByID(t.ID)
+		schedMu.Lock()
+		if s := schedStates[t.ID]; s != nil {
+			s.Running = false
+			if cur != nil {
+				s.Next = nextRunAfter(*cur, time.Now())
+			} else {
+				s.Next = time.Time{}
+			}
+		}
+		schedMu.Unlock()
+	}()
+	defer func() {
+		if e := recover(); e != nil {
+			logErrf("[task:%s] 执行异常: %v", t.Name, e)
+			setTaskResult(t.ID, "error", fmt.Sprint(e))
+		}
+	}()
+
+	trigger := "定时"
+	if manual {
+		trigger = "手动"
+	}
+	start := time.Now()
+	logf("[task:%s] ===== 触发(%s) 内容=%s =====", t.Name, trigger, t.Mode)
+	cfg := currentConfig()
+	st := settingsFromConfig(cfg)
+
+	if t.Mode == "script" {
+		runScriptTask(t, cfg, st)
+		return
+	}
+	if isRunning() {
+		logWarnf("[task:%s] 已有任务运行中, 跳过本次", t.Name)
+		setTaskResult(t.ID, "skipped", "已有任务运行中")
+		return
+	}
+	if !ignoreGuard && (t.Guard.TopSpeedEnabled || t.Guard.SourceChanged) {
+		skip, reason := evaluateGuards(t, st)
+		setPhase("idle", "空闲", 0)
+		if skip {
+			logOkf("[task:%s] 前置条件命中, 跳过执行: %s", t.Name, reason)
+			setTaskResult(t.ID, "skipped", reason)
+			return
+		}
+		logf("[task:%s] 前置条件未命中, 继续执行", t.Name)
+	}
+	if guardOnly {
+		logOkf("[task:%s] 仅预检完成: 可以执行(未启动任务)", t.Name)
+		setTaskResult(t.ID, "ok", "预检通过(未执行)")
+		return
+	}
+	if _, err := startJob(t.Mode, cfg); err != nil {
+		logWarnf("[task:%s] 启动失败: %v", t.Name, err)
+		setTaskResult(t.ID, "skipped", err.Error())
+		return
+	}
+	if done := jobDoneChan(); done != nil {
+		if t.Timeout > 0 {
+			tm := time.NewTimer(time.Duration(t.Timeout) * time.Second)
+			select {
+			case <-done:
+				tm.Stop()
+			case <-tm.C:
+				logWarnf("[task:%s] 超过 %ds 未完成, 请求停止", t.Name, t.Timeout)
+				stopJob()
+				<-done
+			}
+		} else {
+			<-done
+		}
+	}
+	v := jobSnapshot()
+	msg := fmt.Sprintf("有效IP %d / 结果 %d 行 / 耗时 %.1fs", v.Stats.Valid, v.Stats.ResultRows, time.Since(start).Seconds())
+	switch v.Phase {
+	case "done":
+		logOkf("[task:%s] 完成: %s", t.Name, msg)
+		setTaskResult(t.ID, "ok", msg)
+	case "stopped":
+		logWarnf("[task:%s] 已停止: %s", t.Name, msg)
+		setTaskResult(t.ID, "skipped", "任务被停止")
+	default:
+		logErrf("[task:%s] 失败: %s", t.Name, v.Error)
+		setTaskResult(t.ID, "error", v.Error)
+	}
+}
+
+func handleSchedule(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		sc := currentConfig().Schedule
+		type taskView struct {
+			ScheduledTask
+			Next    string `json:"next"`
+			Last    string `json:"last"`
+			Status  string `json:"status"`
+			Msg     string `json:"msg"`
+			Runs    int    `json:"runs"`
+			Skips   int    `json:"skips"`
+			Running bool   `json:"running"`
+		}
+		out := []taskView{}
+		schedMu.Lock()
+		if sc != nil {
+			for _, t := range sc.Tasks {
+				v := taskView{ScheduledTask: t}
+				if s := schedStates[t.ID]; s != nil {
+					v.Next, v.Last = fmtTime(s.Next), fmtTime(s.Last)
+					v.Status, v.Msg = s.Status, s.Msg
+					v.Runs, v.Skips, v.Running = s.Runs, s.Skips, s.Running
+				}
+				out = append(out, v)
+			}
+		}
+		schedMu.Unlock()
+		zone, _ := time.Now().Zone()
+		writeJSON(w, 200, map[string]any{
+			"ok": true, "enabled": sc != nil && sc.Enabled, "tasks": out,
+			"now": time.Now().Format("2006-01-02 15:04:05"), "tz": zone,
+			"job_running": isRunning(),
+		})
+	case http.MethodPost:
+		var sc ScheduleConfig
+		if err := readJSON(r, &sc); err != nil {
+			errJSON(w, 400, err.Error())
+			return
+		}
+		normalizeSchedule(&sc)
+		for _, t := range sc.Tasks {
+			if _, err := parseCron(t.Cron); err != nil {
+				errJSON(w, 400, fmt.Sprintf("任务[%s] cron 无效: %v", t.Name, err))
+				return
+			}
+			if t.Mode == "script" && strings.TrimSpace(t.Script) == "" {
+				errJSON(w, 400, fmt.Sprintf("任务[%s] 脚本内容为空", t.Name))
+				return
+			}
+		}
+		cfg := currentConfig()
+		cfg.Schedule = &sc
+		if err := saveConfigToFile(cfg, configPath()); err != nil {
+			errJSON(w, 500, err.Error())
+			return
+		}
+		setGlobalConfig(cfg)
+		reloadSchedule()
+		logOkf("[sched] 计划任务已保存: %d 个任务, 总开关=%v", len(sc.Tasks), sc.Enabled)
+		writeJSON(w, 200, map[string]any{"ok": true})
+	default:
+		errJSON(w, 405, "方法不允许")
+	}
+}
+
+func handleScheduleRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, 405, "方法不允许")
+		return
+	}
+	var req struct {
+		ID          string `json:"id"`
+		GuardOnly   bool   `json:"guard_only"`
+		IgnoreGuard bool   `json:"ignore_guard"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		errJSON(w, 400, err.Error())
+		return
+	}
+	sc := currentConfig().Schedule
+	var task *ScheduledTask
+	if sc != nil {
+		for i := range sc.Tasks {
+			if sc.Tasks[i].ID == req.ID {
+				task = &sc.Tasks[i]
+				break
+			}
+		}
+	}
+	if task == nil {
+		errJSON(w, 404, "任务不存在")
+		return
+	}
+	schedMu.Lock()
+	s := schedStates[task.ID]
+	if s == nil {
+		s = &taskState{}
+		schedStates[task.ID] = s
+	}
+	if s.Running {
+		schedMu.Unlock()
+		errJSON(w, 409, "该任务正在执行中")
+		return
+	}
+	s.Running, s.Status, s.Last = true, "running", time.Now()
+	schedMu.Unlock()
+	go execScheduledTask(*task, true, req.GuardOnly, req.IgnoreGuard)
+	writeJSON(w, 200, map[string]any{"ok": true})
+}
+
+func handleSchedulePreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		errJSON(w, 405, "方法不允许")
+		return
+	}
+	var req struct {
+		Cron  string `json:"cron"`
+		Count int    `json:"count"`
+	}
+	_ = readJSON(r, &req)
+	sp, err := parseCron(req.Cron)
+	if err != nil {
+		errJSON(w, 400, err.Error())
+		return
+	}
+	n := req.Count
+	if n <= 0 || n > 20 {
+		n = 5
+	}
+	var times []string
+	t := time.Now()
+	for i := 0; i < n; i++ {
+		t = sp.next(t)
+		if t.IsZero() {
+			break
+		}
+		times = append(times, t.Format("2006-01-02 15:04:05 Mon"))
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "times": times})
+}
+
+func handleScheduleSnapshot(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		srcMu.Lock()
+		s := srcSnap
+		srcMu.Unlock()
+		sample := s.IPs
+		if len(sample) > 50 {
+			sample = sample[:50]
+		}
+		writeJSON(w, 200, map[string]any{"ok": true, "time": s.Time, "count": len(s.IPs), "sample": sample, "path": sourceSnapshotPath()})
+	case http.MethodDelete:
+		srcMu.Lock()
+		srcSnap = sourceSnapshot{}
+		srcMu.Unlock()
+		_ = os.Remove(sourceSnapshotPath())
+		logWarnf("[sched] 输入源快照已清空")
+		writeJSON(w, 200, map[string]any{"ok": true})
+	default:
+		errJSON(w, 405, "方法不允许")
+	}
+}
+
 const indexHTML = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1560,6 +2564,7 @@ summary{cursor:pointer;color:#9fb0cc}
   <button data-tab="dns">DNS</button>
   <button data-tab="files">文件</button>
   <button data-tab="tools">工具</button>
+  <button data-tab="sched">计划任务</button>
   <button data-tab="logs">日志</button>
 </nav>
 <main>
@@ -1648,6 +2653,22 @@ summary{cursor:pointer;color:#9fb0cc}
       <h4>推送计划</h4><div class="wrap"><div id="dnsplanbox"></div></div>
       <h4>Cloudflare 现有记录</h4><div class="wrap"><div id="dnsrecbox"></div></div>
     </div>
+    <div class="card">
+      <h3>手动推送 / 更新单条记录</h3>
+      <div class="grid">
+        <div class="fld"><label>类型 type</label><select id="mr_type"><option>A</option><option>AAAA</option><option>CNAME</option><option>TXT</option><option>MX</option><option>NS</option><option>SRV</option><option>CAA</option></select></div>
+        <div class="fld"><label>名称 name(完整域名)</label><input type="text" id="mr_name" placeholder="a.example.com"></div>
+        <div class="fld"><label>内容 content</label><input type="text" id="mr_content" placeholder="1.2.3.4 / 目标域名 / 文本"></div>
+        <div class="fld"><label>TTL 秒(1=自动)</label><input type="number" id="mr_ttl" value="300"></div>
+        <div class="fld"><label>Proxied(仅 A/AAAA/CNAME)</label><label class="chk"><input type="checkbox" id="mr_proxied"> 橙云</label></div>
+        <div class="fld"><label>优先级 priority(可选, MX/SRV)</label><input type="number" id="mr_priority" placeholder="留空不提交"></div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" onclick="pushManualRecord()">提交推送/更新</button>
+        <span id="mrmsg" class="muted"></span>
+      </div>
+      <div class="help">使用 dns_config 的 token / zone_id；同名同类型存在则更新，否则新建，结果只记日志。计划任务脚本可直接调用：<br>curl -s -u 用户:密码 -X POST "http://127.0.0.1:3000/前缀/api/dns/record" -H "Content-Type: application/json" -d '{"type":"A","name":"a.example.com","content":"1.2.3.4","ttl":300,"proxied":false}'</div>
+    </div>
   </section>
 
   <section id="tab-files">
@@ -1688,6 +2709,64 @@ summary{cursor:pointer;color:#9fb0cc}
         <button onclick="testIP()">测试</button>
       </div>
       <pre id="ipout"></pre>
+    </div>
+  </section>
+
+  <section id="tab-sched">
+    <div class="card">
+      <div class="row">
+        <label class="chk"><input type="checkbox" id="sch_enabled" onchange="schDirty()"> 启用调度</label>
+        <button class="primary" onclick="saveSched()">保存计划</button>
+        <button onclick="loadSched()">刷新</button>
+        <button onclick="editTask(-1)">+ 新建任务</button>
+        <span id="schdirty" class="pill warn" style="display:none">有未保存变更</span>
+        <span id="schinfo" class="muted"></span>
+      </div>
+      <div class="help">调度器随 Web 服务运行，Web 不常驻则不执行；服务器本地时区，精度约 5 秒。已有任务运行中时本次触发会被跳过并记录日志。编辑后需点「保存计划」写入配置文件。</div>
+      <div class="wrap"><div id="schtable"></div></div>
+    </div>
+
+    <div class="card" id="schedit" style="display:none">
+      <h3 id="schedit_title">编辑任务</h3>
+      <div class="grid">
+        <div class="fld"><label>任务名称</label><input type="text" id="t_name"></div>
+        <div class="fld"><label>启用</label><label class="chk"><input type="checkbox" id="t_enabled"> 启用</label></div>
+        <div class="fld"><label>执行内容</label><select id="t_mode" onchange="onTaskMode()">
+          <option value="full">完整流程(测速+订阅+DNS)</option>
+          <option value="speedtest">仅测速</option>
+          <option value="sub">仅生成订阅</option>
+          <option value="dns">仅推送 DNS</option>
+          <option value="script">Shell 脚本</option>
+        </select></div>
+        <div class="fld"><label>cron(分 时 日 月 周)</label><input type="text" id="t_cron" placeholder="0 4 * * *"></div>
+        <div class="fld"><label>超时秒(脚本默认600; 任务0=不限)</label><input type="number" id="t_timeout" value="600"></div>
+        <div class="fld" id="t_shellbox"><label>Shell(留空: sh / Windows cmd)</label><input type="text" id="t_shell" placeholder="sh / bash / powershell"></div>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <button class="mini" onclick="previewCron()">校验并预览未来5次</button>
+        <span id="cronmsg" class="muted"></span>
+      </div>
+      <div class="fld wide" id="t_scriptbox"><label>脚本内容(可用环境变量 IPTEST_CONFIG / IPTEST_OUTFILE / IPTEST_SUBDIR / IPTEST_BIN / IPTEST_TASK)</label><textarea id="t_script" rows="6" spellcheck="false"></textarea></div>
+      <div id="t_guardbox">
+        <h4>前置条件(命中则跳过本次执行)</h4>
+        <div class="grid">
+          <div class="fld"><label>① 榜首 IP 复测</label><label class="chk"><input type="checkbox" id="g_top"> 启用</label><div class="help">取上次结果第一名(或指定 IP)单独测速一次，速度 ≥ 阈值则跳过</div></div>
+          <div class="fld"><label>阈值 MB/s</label><input type="number" step="0.1" id="g_topspeed" value="5"></div>
+          <div class="fld"><label>指定 IP(留空=取第一名)</label><input type="text" id="g_topip"></div>
+          <div class="fld"><label>端口(0=用结果中的端口)</label><input type="number" id="g_topport" value="0"></div>
+          <div class="fld"><label>② 输入源有新增才执行</label><label class="chk"><input type="checkbox" id="g_src"> 启用</label><div class="help">先预采集一遍输入源，本次 IP 全部命中上次记录(忽略顺序)则跳过</div></div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <button class="primary" onclick="applyTask()">确定</button>
+        <button onclick="closeTask()">取消</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>输入源快照(条件②比对基准)</h3>
+      <div class="row"><button onclick="loadSnapshot()">刷新</button><button class="danger" onclick="clearSnapshot()">清空快照</button><span id="snapinfo" class="muted"></span></div>
+      <pre id="snapbox"></pre>
     </div>
   </section>
 
@@ -1797,6 +2876,10 @@ function showTab(n){
   if(n==='files')loadFiles();
   if(n==='logs')renderLogs();
   if(n==='cfg')refreshDirty();
+  if(n==='sched'){
+    if(!SCHLOADED||!SCHDIRTY){loadSched();SCHLOADED=true;}
+    loadSnapshot();startSchedTimer();
+  }else{stopSchedTimer();}
 }
 function switchTab(n){
   if(CURTAB==='cfg'&&n!=='cfg'&&isDirty()){
@@ -1805,8 +2888,12 @@ function switchTab(n){
       return;
     }
   }
+  if(CURTAB==='sched'&&n!=='sched'&&SCHDIRTY){
+    if(confirm('计划任务有未保存的变更。\n\n【确定】保存后切换\n【取消】暂不保存直接切换')){saveSched();}
+  }
   showTab(n);
 }
+
 /* ---------- 配置表单 ---------- */
 function buildConfigForm(){
   var h='';
@@ -1865,6 +2952,7 @@ function collectConfig(){
   });});
   if(!c.sub_config)c.sub_config={};
   c.sub_config.templates=collectTemplates();
+  delete c.schedule;
   return c;
 }
 function renderTemplates(){
@@ -2159,6 +3247,141 @@ function testIP(){
   $('ipout').textContent='测试中...';
   api(U('/api/ip/test'),'POST',{ip:$('tip').value,port:parseInt($('tport').value,10)||443,speed:$('tspeed').checked}).then(function(d){$('ipout').textContent=JSON.stringify(d,null,2);}).catch(function(e){$('ipout').textContent='失败: '+e.message;});
 }
+/* ---------- 计划任务(配置与运行状态分离) ---------- */
+var SCHED={enabled:false,tasks:[]},SCHRT={},EDITIDX=-1,SCHDIRTY=false,SCHTIMER=null,SCHLOADED=false;
+function modeText(m){return ({full:'完整流程',speedtest:'仅测速',sub:'仅订阅',dns:'仅DNS',script:'脚本'})[m]||m;}
+function guardText(g){var a=[];if(g&&g.top_speed_enabled)a.push('①≥'+(g.top_speed_mbps||0)+'MB/s');if(g&&g.source_changed_enabled)a.push('②源有新增');return a.length?a.join(' + '):'无';}
+function statPill(s){var c=s==='ok'?'ok':(s==='error'?'err':(s==='skipped'?'warn':(s==='running'?'run':'')));return '<span class="pill '+c+'">'+esc(s||'-')+'</span>';}
+function schDirty(){SCHDIRTY=true;refreshSchDirty();}
+function refreshSchDirty(){var e=$('schdirty');if(e)e.style.display=SCHDIRTY?'':'none';}
+function schTask(t){var g=t.guard||{};return {id:t.id||'',name:t.name||'',enabled:!!t.enabled,cron:t.cron||'',mode:t.mode||'full',shell:t.shell||'',script:t.script||'',timeout_sec:t.timeout_sec||0,
+  guard:{top_speed_enabled:!!g.top_speed_enabled,top_speed_mbps:g.top_speed_mbps||0,top_ip:g.top_ip||'',top_port:g.top_port||0,source_changed_enabled:!!g.source_changed_enabled}};}
+function loadSched(){
+  return api(U('/api/schedule')).then(function(d){
+    SCHED={enabled:!!d.enabled,tasks:(d.tasks||[]).map(schTask)};
+    SCHRT={};(d.tasks||[]).forEach(function(t){SCHRT[t.id]={next:t.next,last:t.last,status:t.status,msg:t.msg,running:t.running};});
+    $('sch_enabled').checked=SCHED.enabled;
+    SCHDIRTY=false;refreshSchDirty();
+    $('schinfo').textContent='服务器时间 '+d.now+' ('+d.tz+') | 共 '+SCHED.tasks.length+' 个任务';
+    renderSched();
+  }).catch(function(e){toast('加载计划失败: '+e.message,'err');});
+}
+function renderSched(){
+  var h='<table><thead><tr><th>#</th><th>名称</th><th>启用</th><th>cron</th><th>内容</th><th>前置条件</th><th>下次执行</th><th>上次</th><th>状态</th><th>操作</th></tr></thead><tbody>';
+  SCHED.tasks.forEach(function(t,i){
+    var r=SCHRT[t.id]||{};
+    h+='<tr><td>'+(i+1)+'</td><td>'+esc(t.name)+'</td>'
+      +'<td><input type="checkbox" '+(t.enabled?'checked':'')+' onchange="setTaskEnabled('+i+',this.checked)"></td>'
+      +'<td>'+esc(t.cron)+'</td><td>'+esc(modeText(t.mode))+'</td><td class="muted">'+esc(guardText(t.guard))+'</td>'
+      +'<td id="rt_next_'+i+'">'+esc(r.next||'-')+'</td>'
+      +'<td id="rt_last_'+i+'" class="muted">'+esc(r.last||'-')+'</td>'
+      +'<td id="rt_stat_'+i+'">'+statPill(r.status)+(r.msg?('<div class="help">'+esc(r.msg)+'</div>'):'')+'</td>'
+      +'<td><button class="mini" onclick="runTask('+i+',false)">执行</button> '
+      +(t.mode==='script'?'':'<button class="mini" onclick="runTask('+i+',true)">仅预检</button> ')
+      +'<button class="mini" onclick="editTask('+i+')">编辑</button> '
+      +'<button class="mini danger" onclick="delTask('+i+')">删除</button></td></tr>';
+  });
+  $('schtable').innerHTML=h+'</tbody></table>';
+}
+function setTaskEnabled(i,v){if(!SCHED.tasks[i])return;SCHED.tasks[i].enabled=!!v;schDirty();}
+function applySchedRuntime(){
+  SCHED.tasks.forEach(function(t,i){
+    var r=SCHRT[t.id];if(!r)return;
+    if(!t.enabled&&!r.running)return;
+    var a=$('rt_next_'+i),b=$('rt_last_'+i),c=$('rt_stat_'+i);
+    if(a)a.textContent=r.next||'-';
+    if(b)b.textContent=r.last||'-';
+    if(c)c.innerHTML=statPill(r.status)+(r.msg?('<div class="help">'+esc(r.msg)+'</div>'):'');
+  });
+}
+function anySchedRunning(){for(var k in SCHRT){if(SCHRT[k]&&SCHRT[k].running)return true;}return false;}
+function refreshSchedStatus(force){
+  if(CURTAB!=='sched')return;
+  if(!force&&!$('sch_enabled').checked&&!anySchedRunning())return;
+  api(U('/api/schedule')).then(function(d){
+    (d.tasks||[]).forEach(function(t){SCHRT[t.id]={next:t.next,last:t.last,status:t.status,msg:t.msg,running:t.running};});
+    $('schinfo').textContent='服务器时间 '+d.now+' ('+d.tz+') | 共 '+SCHED.tasks.length+' 个任务'+(d.job_running?' | 有测速任务运行中':'');
+    applySchedRuntime();
+  }).catch(function(){});
+}
+function startSchedTimer(){stopSchedTimer();SCHTIMER=setInterval(function(){refreshSchedStatus(false);},10000);}
+function stopSchedTimer(){if(SCHTIMER){clearInterval(SCHTIMER);SCHTIMER=null;}}
+function kickSchedStatus(){[800,2500,6000,12000,20000].forEach(function(ms){setTimeout(function(){refreshSchedStatus(true);},ms);});}
+function onTaskMode(){
+  var s=$('t_mode').value==='script';
+  $('t_scriptbox').style.display=s?'':'none';
+  $('t_shellbox').style.display=s?'':'none';
+  $('t_guardbox').style.display=s?'none':'';
+}
+function editTask(i){
+  EDITIDX=i;
+  var t=i<0?{name:'',enabled:true,cron:'0 4 * * *',mode:'full',timeout_sec:0,shell:'',script:'',guard:{top_speed_enabled:false,top_speed_mbps:5,top_ip:'',top_port:0,source_changed_enabled:false}}:SCHED.tasks[i];
+  var g=t.guard||{};
+  $('schedit_title').textContent=i<0?'新建任务':'编辑任务: '+t.name;
+  $('t_name').value=t.name||'';$('t_enabled').checked=!!t.enabled;
+  $('t_mode').value=t.mode||'full';$('t_cron').value=t.cron||'';
+  $('t_timeout').value=t.timeout_sec||0;$('t_shell').value=t.shell||'';$('t_script').value=t.script||'';
+  $('g_top').checked=!!g.top_speed_enabled;$('g_topspeed').value=g.top_speed_mbps||5;
+  $('g_topip').value=g.top_ip||'';$('g_topport').value=g.top_port||0;
+  $('g_src').checked=!!g.source_changed_enabled;
+  $('cronmsg').textContent='';$('schedit').style.display='';onTaskMode();
+}
+function closeTask(){$('schedit').style.display='none';EDITIDX=-1;}
+function applyTask(){
+  var t={
+    id:EDITIDX>=0?(SCHED.tasks[EDITIDX].id||''):'',
+    name:$('t_name').value.trim(),enabled:$('t_enabled').checked,
+    cron:$('t_cron').value.trim(),mode:$('t_mode').value,
+    timeout_sec:parseInt($('t_timeout').value,10)||0,
+    shell:$('t_shell').value.trim(),script:$('t_script').value,
+    guard:{top_speed_enabled:$('g_top').checked,top_speed_mbps:parseFloat($('g_topspeed').value)||0,
+           top_ip:$('g_topip').value.trim(),top_port:parseInt($('g_topport').value,10)||0,
+           source_changed_enabled:$('g_src').checked}
+  };
+  if(EDITIDX<0)SCHED.tasks.push(t);else SCHED.tasks[EDITIDX]=t;
+  closeTask();renderSched();schDirty();toast('已修改，请点「保存计划」写入配置','ok');
+}
+function delTask(i){if(!confirm('删除任务 '+SCHED.tasks[i].name+' ?'))return;SCHED.tasks.splice(i,1);renderSched();schDirty();}
+function saveSched(){
+  api(U('/api/schedule'),'POST',{enabled:$('sch_enabled').checked,tasks:SCHED.tasks})
+    .then(function(){toast('计划已保存并重新初始化','ok');return loadSched();})
+    .catch(function(e){toast('保存失败: '+e.message,'err');});
+}
+function runTask(i,guardOnly){
+  var t=SCHED.tasks[i];if(!t)return;
+  if(SCHDIRTY&&!confirm('有未保存的修改, 立即执行将使用【已保存】的任务定义。继续?'))return;
+  api(U('/api/schedule/run'),'POST',{id:t.id,guard_only:!!guardOnly})
+    .then(function(){toast(guardOnly?'已开始预检':'已开始执行','ok');kickSchedStatus();})
+    .catch(function(e){toast(e.message,'err');});
+}
+function previewCron(){
+  api(U('/api/schedule/preview'),'POST',{cron:$('t_cron').value,count:5})
+    .then(function(d){$('cronmsg').textContent='未来执行: '+(d.times||[]).join(' | ');})
+    .catch(function(e){$('cronmsg').textContent='表达式无效: '+e.message;});
+}
+function loadSnapshot(){
+  api(U('/api/schedule/snapshot')).then(function(d){
+    $('snapinfo').textContent=d.count+' 个 IP | 采集时间 '+(d.time||'-')+' | '+d.path;
+    $('snapbox').textContent=(d.sample||[]).join('\n')+(d.count>50?'\n... 仅展示前 50 条':'');
+  }).catch(function(e){toast(e.message,'err');});
+}
+function clearSnapshot(){
+  if(!confirm('清空输入源快照? 下次条件②将视为“无历史记录”并执行'))return;
+  api(U('/api/schedule/snapshot'),'DELETE').then(function(){toast('已清空','ok');loadSnapshot();}).catch(function(e){toast(e.message,'err');});
+}
+/* ---------- DNS 手动记录 ---------- */
+function pushManualRecord(){
+  var p=$('mr_priority').value.trim();
+  var b={type:$('mr_type').value,name:$('mr_name').value.trim(),content:$('mr_content').value.trim(),
+         ttl:parseInt($('mr_ttl').value,10)||300,proxied:$('mr_proxied').checked};
+  if(!b.name||!b.content){toast('name 与 content 必填','err');return;}
+  if(p!=='')b.priority=parseInt(p,10)||0;
+  $('mrmsg').textContent='提交中...';
+  api(U('/api/dns/record'),'POST',b).then(function(){
+    $('mrmsg').textContent='成功: '+b.name+' ('+b.type+') → '+b.content;
+    toast('DNS 记录已推送/更新','ok');
+  }).catch(function(e){$('mrmsg').textContent='失败: '+e.message;toast(e.message,'err');});
+}
 /* ---------- 初始化 ---------- */
 window.addEventListener('DOMContentLoaded',function(){
   buildConfigForm();
@@ -2170,9 +3393,8 @@ window.addEventListener('DOMContentLoaded',function(){
   loadConfig(false).then(function(){return loadState();});
   connectSSE();
   loadResults();
-  setInterval(function(){loadState();},5000);
 });
-window.addEventListener('beforeunload',function(e){if(isDirty()){e.preventDefault();e.returnValue='';}});
+window.addEventListener('beforeunload',function(e){if(isDirty()||SCHDIRTY){e.preventDefault();e.returnValue='';}});
 </script>
 </body>
 </html>`

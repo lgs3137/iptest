@@ -65,29 +65,30 @@ var (
 )
 
 type AppConfig struct {
-	File            []string  `json:"file"`
-	OutFile         string    `json:"outfile"`
-	Proxy           string    `json:"proxy"`
-	Max             int       `json:"max"`
-	SpeedTest       int       `json:"speedtest"`
-	URL             string    `json:"url"`
-	Delay           int       `json:"delay"`
-	MinSpeed        float64   `json:"min_speed"`
-	MinSpeedCount   int       `json:"min_speed_count"`
-	Rounds          int       `json:"rounds"`
-	HistoryEnable   bool      `json:"history_enable"`
-	History         string    `json:"history"`
-	HistoryCount    int       `json:"history_count"`
-	HistoryLimit    int       `json:"history_limit"`
-	TCPTimeout      int       `json:"tcp_timeout_ms"`
-	ProbeTimeout    int       `json:"probe_timeout_ms"`
-	DownloadTimeout int       `json:"download_timeout_ms"`
-	SourceTimeout   int       `json:"source_timeout_ms"`
-	SourceDepth     int       `json:"source_depth"`
-	ProbeURL        string    `json:"probe_url"`
-	SubConfig       SubConfig `json:"sub_config"`
-	DNSConfig       DNSConfig `json:"dns_config"`
-	WebConfig       WebConfig `json:"web_config"`
+	File            []string        `json:"file"`
+	OutFile         string          `json:"outfile"`
+	Proxy           string          `json:"proxy"`
+	Max             int             `json:"max"`
+	SpeedTest       int             `json:"speedtest"`
+	URL             string          `json:"url"`
+	Delay           int             `json:"delay"`
+	MinSpeed        float64         `json:"min_speed"`
+	MinSpeedCount   int             `json:"min_speed_count"`
+	Rounds          int             `json:"rounds"`
+	HistoryEnable   bool            `json:"history_enable"`
+	History         string          `json:"history"`
+	HistoryCount    int             `json:"history_count"`
+	HistoryLimit    int             `json:"history_limit"`
+	TCPTimeout      int             `json:"tcp_timeout_ms"`
+	ProbeTimeout    int             `json:"probe_timeout_ms"`
+	DownloadTimeout int             `json:"download_timeout_ms"`
+	SourceTimeout   int             `json:"source_timeout_ms"`
+	SourceDepth     int             `json:"source_depth"`
+	ProbeURL        string          `json:"probe_url"`
+	SubConfig       SubConfig       `json:"sub_config"`
+	DNSConfig       DNSConfig       `json:"dns_config"`
+	WebConfig       WebConfig       `json:"web_config"`
+	Schedule        *ScheduleConfig `json:"schedule,omitempty"`
 }
 
 type WebConfig struct {
@@ -212,7 +213,27 @@ func defaultAppConfig() AppConfig {
 		},
 		WebConfig: WebConfig{
 			Enabled: true, Host: "0.0.0.0", Port: 3000, PathPrefix: "",
-			AutoRun: false, LogBuffer: 5000, Username: "admin", Password: "",
+			AutoRun: false, LogBuffer: 5000, Username: "iptest", Password: "",
+		},
+		Schedule: &ScheduleConfig{
+			Enabled: false,
+			Tasks: []ScheduledTask{
+				{
+					ID: "task-1", Name: "每2小时全流程(榜首掉速才执行)", Enabled: false,
+					Cron: "0 */2 * * *", Mode: "full",
+					Guard: TaskGuard{TopSpeedEnabled: true, TopSpeedMBps: 5},
+				},
+				{
+					ID: "task-2", Name: "每日全流程(源有新增才执行)", Enabled: false,
+					Cron: "0 4 * * *", Mode: "full",
+					Guard: TaskGuard{SourceChanged: true},
+				},
+				{
+					ID: "task-3", Name: "示例脚本(每日05:00)", Enabled: false,
+					Cron: "0 5 * * *", Mode: "script", Timeout: 600,
+					Script: "echo \"hello from iptest\"\ndate\n",
+				},
+			},
 		},
 	}
 }
@@ -344,8 +365,12 @@ func normalizeConfig(cfg *AppConfig) {
 		cfg.WebConfig.LogBuffer = 5000
 	}
 	if strings.TrimSpace(cfg.WebConfig.Username) == "" {
-		cfg.WebConfig.Username = "admin"
+		cfg.WebConfig.Username = "iptest"
 	}
+	if cfg.Schedule == nil {
+		cfg.Schedule = &ScheduleConfig{}
+	}
+	normalizeSchedule(cfg.Schedule)
 }
 
 func generateDefaultConfig(path string) error {
@@ -1534,6 +1559,7 @@ func fetchIPsFromSources(ctx context.Context, st Settings, sources []string, max
 	}
 	updateStats(func(s *RunStats) { s.Sources = processed })
 	logOkf("[source] 完成: 共处理 %d 个来源, 提取唯一 IP: %d 个", processed, len(ipOrder))
+	noteSourceIPs(ipOrder)
 	return ipOrder, nil
 }
 

@@ -25,11 +25,12 @@ type DNSConfig struct {
 }
 
 type CloudflareDNSRecord struct {
-	Type    string `json:"type"`
-	Name    string `json:"name"`
-	Content string `json:"content"`
-	TTL     int    `json:"ttl"`
-	Proxied bool   `json:"proxied"`
+	Type     string `json:"type"`
+	Name     string `json:"name"`
+	Content  string `json:"content"`
+	TTL      int    `json:"ttl"`
+	Proxied  bool   `json:"proxied"`
+	Priority *int   `json:"priority,omitempty"`
 }
 
 type CFError struct {
@@ -143,13 +144,21 @@ func PushToCloudflareDNS(ctx context.Context, results []SpeedResult, cfg DNSConf
 }
 
 func createOrUpdateCFRecord(ctx context.Context, name, ip, recordType string, cfg DNSConfig) error {
-	ttl := cfg.TTL
-	if ttl <= 0 {
-		ttl = 300
+	return upsertCFRecord(ctx, cfg, CloudflareDNSRecord{
+		Type: recordType, Name: name, Content: ip, TTL: cfg.TTL, Proxied: cfg.Proxied,
+	})
+}
+
+func upsertCFRecord(ctx context.Context, cfg DNSConfig, rec CloudflareDNSRecord) error {
+	if err := checkDNSCfg(cfg); err != nil {
+		return err
+	}
+	if rec.TTL <= 0 {
+		rec.TTL = 300
 	}
 	client := newOutboundHTTPClient(30 * time.Second)
 	searchURL := fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records?name=%s&type=%s",
-		cfg.ZoneID, url.QueryEscape(name), recordType)
+		cfg.ZoneID, url.QueryEscape(rec.Name), url.QueryEscape(rec.Type))
 	reqSearch, err := http.NewRequestWithContext(ctx, "GET", searchURL, nil)
 	if err != nil {
 		return err
@@ -169,8 +178,7 @@ func createOrUpdateCFRecord(ctx context.Context, name, ip, recordType string, cf
 		return fmt.Errorf("查询记录失败: %s", cfErrText(listResp.Errors))
 	}
 
-	record := CloudflareDNSRecord{Type: recordType, Name: name, Content: ip, TTL: ttl, Proxied: cfg.Proxied}
-	body, _ := json.Marshal(record)
+	body, _ := json.Marshal(rec)
 	var apiURL, method string
 	if len(listResp.Result) > 0 {
 		apiURL = fmt.Sprintf("https://api.cloudflare.com/client/v4/zones/%s/dns_records/%s", cfg.ZoneID, listResp.Result[0].ID)
